@@ -1,0 +1,38 @@
+# python classification_vit/train.py -c classification_vit/config/HexFormer.txt
+
+# Output settings
+exp_name = Hexformer_Tiny-ViT_CIFAR-100
+output_dir = classification_vit/output/CIFAR-100
+
+# General settings
+device = cuda:0
+dtype = float32
+seed = 1
+histogram = False
+#load_checkpoint = classification/output/Hexformer_Tiny-ViT.pth
+
+# General training hyperparameters
+num_epochs = 100
+warmup = 0
+batch_size = 128
+lr = 4.35e-3
+weight_decay = 5e-2
+optimizer = RiemannianAdamW
+
+# General validation/testing hyperparameters
+batch_size_test = 512
+
+# Model selection
+patch_size = 4
+model_size = tiny # small or base
+
+#num_layers = 9 #12 #9
+#hidden_dim = 192 #384 #768 #192
+#mlp_dim = 384 #768 #3072 #384
+#num_heads = 12 #6 #12
+
+encoder_manifold = lorentz
+decoder_manifold = lorentz
+
+# Dataset settings
+dataset = CIFAR-100 # CIFAR-10 or Tiny-ImageNet
