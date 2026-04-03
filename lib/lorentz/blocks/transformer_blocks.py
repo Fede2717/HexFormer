@@ -108,19 +108,42 @@ class LorentzMultiHeadAttention(nn.Module):
         mean_v = self.manifold.expmap0(mean_v_tangent)  # Shape: [128, 12, 17]
         return mean_v
 
-    def forward(self, x):
+def forward(self, x):
         b, n, l = x.size()
 
-        # Internal Lorentz direct split (LFC splits into heads internally)
+        # Internal Lorentz direct split
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
 
-        dists = -self.manifold.csqdist(q, k)*self.scale.expand((b, self.heads, 1, 1))
+        # 1. Separazione asse temporale e spaziale
+        q_time = q.narrow(-1, 0, 1)
+        k_time = k.narrow(-1, 0, 1)
+        q_space = q.narrow(-1, 1, q.shape[-1] - 1)
+        k_space = k.narrow(-1, 1, k.shape[-1] - 1)
+
+        sqrt_k = torch.sqrt(self.manifold.k)
+
+        # 2. Distanze dall'origine (Norme Iperboliche) con clamp per FP32
+        norm_q = sqrt_k * torch.acosh(torch.clamp_min(q_time / sqrt_k, 1.0 + 1e-7))
+        norm_k = sqrt_k * torch.acosh(torch.clamp_min(k_time / sqrt_k, 1.0 + 1e-7))
+
+        norm_matrix = norm_q @ norm_k.transpose(-1, -2)
+
+        # 3. Coseno dell'angolo
+        dot_space = q_space @ k_space.transpose(-1, -2)
+        norm_q_space = torch.norm(q_space, dim=-1, keepdim=True)
+        norm_k_space = torch.norm(k_space, dim=-1, keepdim=True)
+        
+        denom_space = torch.clamp_min(norm_q_space @ norm_k_space.transpose(-1, -2), 1e-8)
+        cos_theta = dot_space / denom_space
+
+        # 4. Score Finale
+        score_matrix = norm_matrix * cos_theta
+        dists = score_matrix * self.scale.expand((b, self.heads, 1, 1))
 
         score = self.softmax(dists / self.temperature)
 
-        # attn = self.manifold.centroid(v, w=score).permute(0,2,1,3)
         attn = self.lorentz_expmap_aggregation(v, score).permute(0, 2, 1, 3)
         
         # Lorentz direct concatenation of heads
@@ -129,6 +152,6 @@ class LorentzMultiHeadAttention(nn.Module):
         attn_time_rescaled = torch.sqrt(torch.sum(attn_time ** 2, dim=-1, keepdim=True) - ((self.heads - 1) * self.manifold.k))
         attn = torch.concat((attn_time_rescaled, attn_space), dim=-1)
 
-        o = self.o(attn) # internal dropout in LFC
+        o = self.o(attn)
         return o
     
