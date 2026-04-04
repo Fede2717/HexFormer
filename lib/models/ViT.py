@@ -57,7 +57,11 @@ class ViT(nn.Module):
 
         self.embed = self._get_embedding()
 
-        enc_list = [self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout) for _ in range(num_layers)]
+        enc_list = [
+            self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout,
+                                         is_last_layer=(i == num_layers - 1))
+            for i in range(num_layers)
+        ]
         self.encoder = nn.Sequential(*enc_list)
 
         self.final_ln = self._get_layerNorm(hidden_dim)
@@ -97,12 +101,13 @@ class ViT(nn.Module):
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
     
-    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout):
+    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, is_last_layer=False):
         if self.manifold is None:
             return TransformerEncoder(hidden_dim, mlp_dim, num_patches, heads, dropout)
 
         elif type(self.manifold) is CustomLorentz:
-            return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout)
+            return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout,
+                                             is_last_layer=is_last_layer)
 
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")

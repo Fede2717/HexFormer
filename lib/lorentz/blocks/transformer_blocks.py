@@ -40,7 +40,7 @@ class LorentzEmbedding(nn.Module):
 
 
 class LorentzTransformerEncoder(nn.Module):
-    def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout, stochastic_depth=0.1):
+    def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout, stochastic_depth=0.1, is_last_layer=False):
         super(LorentzTransformerEncoder, self).__init__()
 
         self.manifold = manifold
@@ -52,7 +52,7 @@ class LorentzTransformerEncoder(nn.Module):
         self.dropout = dropout
 
         self.ln1 = LorentzLayerNorm(manifold, hidden)
-        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout)
+        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, is_last_layer=is_last_layer)
         self.ln2 = LorentzLayerNorm(manifold, hidden)
         self.mlp = nn.Sequential(
             LorentzFullyConnected(manifold, hidden, mlp_hidden, activation=nn.GELU(), dropout=dropout), # ->internal gelu + dropout
@@ -70,7 +70,7 @@ class LorentzTransformerEncoder(nn.Module):
 
 # expmap_aggregation
 class LorentzMultiHeadAttention(nn.Module):
-    def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0, learn_scale=False):
+    def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0, learn_scale=False, is_last_layer=False):
         super(LorentzMultiHeadAttention, self).__init__()
 
         self.manifold = manifold
@@ -81,7 +81,7 @@ class LorentzMultiHeadAttention(nn.Module):
         self.head_dim = (num_features-1)//heads
         self.temperature = nn.Parameter(torch.ones(1))  # Initialize temperature
         self.scale = nn.Parameter(self.head_dim**(-0.5)*torch.ones((1, heads, 1, 1)), requires_grad=learn_scale)
-                
+
         self.softmax = nn.Softmax(dim=-1)
 
         self.q = LorentzFullyConnected(manifold, num_features, num_features, nheads=heads, bias=False)
@@ -89,6 +89,18 @@ class LorentzMultiHeadAttention(nn.Module):
         self.v = LorentzFullyConnected(manifold, num_features, num_features, nheads=heads, bias=False)
 
         self.o = LorentzFullyConnected(manifold, num_features, num_features, dropout=dropout)
+
+        self.is_last_layer = is_last_layer
+        if is_last_layer:
+            self.alpha_raw = nn.Parameter(torch.zeros(1))
+            self.tau_raw   = nn.Parameter(torch.zeros(1))
+            self.haa_alpha         = 0.0
+            self.haa_tau           = 0.0
+            self.haa_mean_c_tilde  = 0.0
+            self.haa_mean_b_tilde  = 0.0
+            self.haa_mean_B        = 0.0
+            self.haa_mean_Z        = 0.0
+            self.haa_cone_sparsity = 0.0
     
     def lorentz_expmap_aggregation(self, v, score):
         """
@@ -123,29 +135,92 @@ class LorentzMultiHeadAttention(nn.Module):
             k_space = k.narrow(-1, 1, k.shape[-1] - 1)
 
             sqrt_k = torch.sqrt(self.manifold.k)
+            K = self.manifold.k
 
-            # 2. Distanze dall'origine (Norme Iperboliche) con clamp per FP32
-            norm_q = sqrt_k * torch.acosh(torch.clamp_min(q_time / sqrt_k, 1.0 + 1e-7))
-            norm_k = sqrt_k * torch.acosh(torch.clamp_min(k_time / sqrt_k, 1.0 + 1e-7))
+            if self.is_last_layer:
+                # ---- HAA Scoring ----
 
-            norm_matrix = norm_q @ norm_k.transpose(-1, -2)
+                # 1. Pairwise Lorentz inner product
+                inner_QK = -q_time @ k_time.transpose(-1, -2) + q_space @ k_space.transpose(-1, -2)
 
-            # 3. Coseno dell'angolo
-            dot_space = q_space @ k_space.transpose(-1, -2)
-            norm_q_space = torch.norm(q_space, dim=-1, keepdim=True)
-            norm_k_space = torch.norm(k_space, dim=-1, keepdim=True)
-            
-            denom_space = torch.clamp_min(norm_q_space @ norm_k_space.transpose(-1, -2), 1e-8)
-            cos_theta = dot_space / denom_space
+                # 2. Raw cosh (Strictly clamped to >= 1.0 to prevent domain errors)
+                raw_cosh_QK = (-inner_QK / K).clamp_min(1.0)
 
-            # 4. Score Finale
-            score_matrix = norm_matrix * cos_theta
-            dists = score_matrix * self.scale.expand((b, self.heads, 1, 1))
+                # 3. Create Diagonal/Self-Attention Mask
+                is_self_attn = (raw_cosh_QK < 1.0 + 1e-5)
 
-            score = self.softmax(dists / self.temperature)
+                # 4. Safe Input Masking for acosh derivative
+                # Feed '2.0' to the diagonal to safely bypass the infinite gradient at acosh(1.0)
+                safe_cosh_QK = torch.where(is_self_attn, torch.tensor(2.0, device=raw_cosh_QK.device), raw_cosh_QK)
+                dist_QK = (sqrt_k * torch.acosh(safe_cosh_QK)).clamp(max=80.0)
+
+                # 5. Origin Distances and Scaled Depths
+                cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
+                cosh_OK = (k_time / sqrt_k).clamp_min(1.0 + 1e-7)
+                dist_OQ = (sqrt_k * torch.acosh(cosh_OQ)).clamp(max=80.0)
+
+                c_tilde = dist_OQ / sqrt_k
+                # Calculate b_tilde for telemetry only
+                b_tilde = (sqrt_k * torch.acosh(cosh_OK)).clamp(max=80.0) / sqrt_k
+
+                # 6. Sinh terms (Computed cleanly using the safe masked distances)
+                sinh_QK = torch.sinh(dist_QK / sqrt_k)
+                sinh_OQ = torch.sinh(c_tilde)
+
+                # 7. Alignment Z via Hyperbolic Law of Cosines
+                # Numerator utilizes raw_cosh_QK to preserve exact gradients for non-diagonal elements
+                numer = raw_cosh_QK * cosh_OQ - cosh_OK.transpose(-1, -2)
+                denom = sinh_OQ * sinh_QK
+
+                raw_Z = numer / denom
+
+                # 8. Output Masking
+                # Force exact alignment (1.0) on the diagonal, overriding the dummy calculations
+                Z = torch.where(is_self_attn, torch.tensor(1.0, device=raw_Z.device), raw_Z).clamp(-0.9999, 0.9999)
+
+                # 9. Aperture B
+                alpha = F.softplus(self.alpha_raw)
+                B = (alpha * c_tilde) / (1.0 + alpha * c_tilde)
+
+                # 10. Final Score
+                tau = F.softplus(self.tau_raw)
+                score_matrix = -tau * F.relu(B - Z)
+                score = self.softmax(score_matrix)
+
+                # ---- Telemetry ----
+                self.haa_alpha         = alpha.item()
+                self.haa_tau           = tau.item()
+                self.haa_mean_c_tilde  = c_tilde.mean().item()
+                self.haa_mean_b_tilde  = b_tilde.mean().item()
+                self.haa_mean_B        = B.mean().item()
+                self.haa_mean_Z        = Z.mean().item()
+                self.haa_cone_sparsity = ((B - Z) <= 0).float().mean().item()
+
+            else:
+                # ---- Existing tangent-space scoring ----
+
+                # 2. Distanze dall'origine (Norme Iperboliche) con clamp per FP32
+                norm_q = sqrt_k * torch.acosh(torch.clamp_min(q_time / sqrt_k, 1.0 + 1e-7))
+                norm_k = sqrt_k * torch.acosh(torch.clamp_min(k_time / sqrt_k, 1.0 + 1e-7))
+
+                norm_matrix = norm_q @ norm_k.transpose(-1, -2)
+
+                # 3. Coseno dell'angolo
+                dot_space = q_space @ k_space.transpose(-1, -2)
+                norm_q_space = torch.norm(q_space, dim=-1, keepdim=True)
+                norm_k_space = torch.norm(k_space, dim=-1, keepdim=True)
+
+                denom_space = torch.clamp_min(norm_q_space @ norm_k_space.transpose(-1, -2), 1e-8)
+                cos_theta = dot_space / denom_space
+
+                # 4. Score Finale
+                score_matrix = norm_matrix * cos_theta
+                dists = score_matrix * self.scale.expand((b, self.heads, 1, 1))
+
+                score = self.softmax(dists / self.temperature)
 
             attn = self.lorentz_expmap_aggregation(v, score).permute(0, 2, 1, 3)
-            
+
             # Lorentz direct concatenation of heads
             attn_space = attn.narrow(-1, 1, attn.shape[-1]-1).reshape(b, n, -1)
             attn_time = attn.narrow(-1, 0, 1).reshape(b, n, -1)

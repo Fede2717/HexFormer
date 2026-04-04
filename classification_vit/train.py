@@ -164,6 +164,16 @@ def main(args):
     if args.compile:
         model = torch.compile(model)
 
+    # Get reference to HAA attention module for telemetry (single-GPU: DataParallel calls original module directly)
+    _haa_mha = None
+    if args.encoder_manifold == 'lorentz':
+        try:
+            _haa_mha = model.module.encoder.encoder[-1].mha
+            if not _haa_mha.is_last_layer:
+                _haa_mha = None
+        except AttributeError:
+            _haa_mha = None
+
     # Initialize TensorBoard writer
     # Set up TensorBoard logging directory with a unique name for each experiment
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -250,8 +260,16 @@ def main(args):
                 acc5.update(top5.item())
 
             global_step += 1
-            
+
             writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+            if _haa_mha is not None:
+                writer.add_scalar('HAA/alpha',         _haa_mha.haa_alpha,         global_step)
+                writer.add_scalar('HAA/tau',           _haa_mha.haa_tau,           global_step)
+                writer.add_scalar('HAA/mean_c_tilde',  _haa_mha.haa_mean_c_tilde,  global_step)
+                writer.add_scalar('HAA/mean_b_tilde',  _haa_mha.haa_mean_b_tilde,  global_step)
+                writer.add_scalar('HAA/mean_B',        _haa_mha.haa_mean_B,        global_step)
+                writer.add_scalar('HAA/mean_Z',        _haa_mha.haa_mean_Z,        global_step)
+                writer.add_scalar('HAA/cone_sparsity', _haa_mha.haa_cone_sparsity, global_step)
             # ------- End iteration -------
         # Log training metrics to TensorBoard
         writer.add_scalar('Loss/train', losses.avg, epoch)
