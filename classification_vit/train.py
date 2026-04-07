@@ -265,6 +265,7 @@ def main(args):
             if _haa_mha is not None:
                 writer.add_scalar('HAA/alpha',         _haa_mha.haa_alpha,         global_step)
                 writer.add_scalar('HAA/tau',           _haa_mha.haa_tau,           global_step)
+                writer.add_scalar('HAA/lambda',        _haa_mha.haa_lambda,        global_step)
                 writer.add_scalar('HAA/mean_c_tilde',  _haa_mha.haa_mean_c_tilde,  global_step)
                 writer.add_scalar('HAA/mean_b_tilde',  _haa_mha.haa_mean_b_tilde,  global_step)
                 writer.add_scalar('HAA/mean_B',        _haa_mha.haa_mean_B,        global_step)

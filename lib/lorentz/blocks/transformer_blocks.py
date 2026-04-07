@@ -14,6 +14,30 @@ from lib.lorentz.layers import (
 LorentzAct
 )
 
+class STE_Z_Clamp(torch.autograd.Function):
+    """Straight-Through Estimator: clamps to [-1, 1] in forward, identity in backward."""
+    @staticmethod
+    def forward(ctx, x):
+        return x.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
+class STE_Dist_Clamp(torch.autograd.Function):
+    """Straight-Through Estimator: dtype-aware distance clamp in forward, identity in backward."""
+    @staticmethod
+    def forward(ctx, x):
+        if x.dtype == torch.float16:
+            return x.clamp(max=11.0)
+        return x.clamp(max=80.0)  # bfloat16 or float32
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 class LorentzEmbedding(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden_dim, patch_dim, num_tokens):
         super(LorentzEmbedding, self).__init__()
@@ -92,10 +116,12 @@ class LorentzMultiHeadAttention(nn.Module):
 
         self.is_last_layer = is_last_layer
         if is_last_layer:
-            self.alpha_raw = nn.Parameter(torch.zeros(1))
-            self.tau_raw   = nn.Parameter(torch.zeros(1))
+            self.alpha_raw  = nn.Parameter(torch.zeros(1))
+            self.tau_raw    = nn.Parameter(torch.zeros(1))
+            self.lambda_raw = nn.Parameter(torch.zeros(1))
             self.haa_alpha         = 0.0
             self.haa_tau           = 0.0
+            self.haa_lambda        = 0.0
             self.haa_mean_c_tilde  = 0.0
             self.haa_mean_b_tilde  = 0.0
             self.haa_mean_B        = 0.0
@@ -138,21 +164,21 @@ class LorentzMultiHeadAttention(nn.Module):
             K = self.manifold.k
 
             if self.is_last_layer:
-                # ---- HAA Scoring ----
+                # ---- HAA V5 Scoring ----
+                orig_dtype = q_time.dtype
 
                 # 1. Pairwise Lorentz inner product
                 inner_QK = -q_time @ k_time.transpose(-1, -2) + q_space @ k_space.transpose(-1, -2)
 
-                # 2. Raw cosh (Strictly clamped to >= 1.0 to prevent domain errors)
+                # 2. Raw cosh (clamped >= 1.0 to prevent domain errors)
                 raw_cosh_QK = (-inner_QK / K).clamp_min(1.0)
 
-                # 3. Create Diagonal/Self-Attention Mask
+                # 3. Diagonal/Self-Attention Mask
                 is_self_attn = (raw_cosh_QK < 1.0 + 1e-5)
 
-                # 4. Safe Input Masking for acosh derivative
-                # Feed '2.0' to the diagonal to safely bypass the infinite gradient at acosh(1.0)
+                # 4. Safe acosh: feed 2.0 to diagonal to avoid infinite gradient at acosh(1.0)
                 safe_cosh_QK = torch.where(is_self_attn, torch.tensor(2.0, device=raw_cosh_QK.device), raw_cosh_QK)
-                dist_QK = (sqrt_k * torch.acosh(safe_cosh_QK)).clamp(max=80.0)
+                dist_QK = sqrt_k * torch.acosh(safe_cosh_QK)
 
                 # 5. Origin Distances and Scaled Depths
                 cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
@@ -160,41 +186,53 @@ class LorentzMultiHeadAttention(nn.Module):
                 dist_OQ = (sqrt_k * torch.acosh(cosh_OQ)).clamp(max=80.0)
 
                 c_tilde = dist_OQ / sqrt_k
-                # Calculate b_tilde for telemetry only
-                b_tilde = (sqrt_k * torch.acosh(cosh_OK)).clamp(max=80.0) / sqrt_k
+                b_tilde = (sqrt_k * torch.acosh(cosh_OK)).clamp(max=80.0) / sqrt_k  # telemetry only
 
-                # 6. Sinh terms (Computed cleanly using the safe masked distances)
+                # 6. Sinh terms (computed directly, not via sqrt-of-cosh²)
                 sinh_QK = torch.sinh(dist_QK / sqrt_k)
                 sinh_OQ = torch.sinh(c_tilde)
 
-                # 7. Alignment Z via Hyperbolic Law of Cosines
-                # Numerator utilizes raw_cosh_QK to preserve exact gradients for non-diagonal elements
-                numer = raw_cosh_QK * cosh_OQ - cosh_OK.transpose(-1, -2)
+                # 7. HLoC Numerator — upcast to FP64 to prevent catastrophic cancellation
+                numer = (
+                    raw_cosh_QK.double() * cosh_OQ.double()
+                    - cosh_OK.transpose(-1, -2).double()
+                ).to(orig_dtype)
                 denom = sinh_OQ * sinh_QK
 
                 raw_Z = numer / denom
 
-                # 8. Output Masking
-                # Force exact alignment (1.0) on the diagonal, overriding the dummy calculations
-                Z = torch.where(is_self_attn, torch.tensor(1.0, device=raw_Z.device), raw_Z).clamp(-0.9999, 0.9999)
+                # 8. STE clamp on raw_Z, then diagonal masking
+                Z_clamped = STE_Z_Clamp.apply(raw_Z)
+                Z_safe = torch.where(is_self_attn, torch.tensor(1.0, device=Z_clamped.device, dtype=Z_clamped.dtype), Z_clamped)
 
                 # 9. Aperture B
                 alpha = F.softplus(self.alpha_raw)
                 B = (alpha * c_tilde) / (1.0 + alpha * c_tilde)
 
-                # 10. Final Score
+                # 10. Log-distance attraction term
+                lam = F.softplus(self.lambda_raw)
+                d_L = STE_Dist_Clamp.apply(dist_QK)
+                log_dist_penalty = -lam * torch.log(1.0 + d_L ** 2)
+
+                # 11. Margin-Softplus (Phi) entailment penalty — m = 0.1 (fixed)
+                _m = 0.1
+                _softplus_neg_m = F.softplus(torch.tensor(-_m, device=B.device, dtype=B.dtype))
+                entailment_penalty = F.softplus((B - Z_safe) - _m) - _softplus_neg_m
+
+                # 12. Final V5 score
                 tau = F.softplus(self.tau_raw)
-                score_matrix = -tau * F.relu(B - Z)
+                score_matrix = log_dist_penalty - tau * entailment_penalty
                 score = self.softmax(score_matrix)
 
                 # ---- Telemetry ----
                 self.haa_alpha         = alpha.item()
                 self.haa_tau           = tau.item()
+                self.haa_lambda        = lam.item()
                 self.haa_mean_c_tilde  = c_tilde.mean().item()
                 self.haa_mean_b_tilde  = b_tilde.mean().item()
                 self.haa_mean_B        = B.mean().item()
-                self.haa_mean_Z        = Z.mean().item()
-                self.haa_cone_sparsity = ((B - Z) <= 0).float().mean().item()
+                self.haa_mean_Z        = Z_safe.mean().item()
+                self.haa_cone_sparsity = ((B - Z_safe) <= 0).float().mean().item()
 
             else:
                 # ---- Existing tangent-space scoring ----
