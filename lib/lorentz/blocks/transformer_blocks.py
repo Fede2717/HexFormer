@@ -14,29 +14,6 @@ from lib.lorentz.layers import (
 LorentzAct
 )
 
-class STE_Z_Clamp(torch.autograd.Function):
-    """Straight-Through Estimator: clamps to [-1, 1] in forward, identity in backward."""
-    @staticmethod
-    def forward(ctx, x):
-        return x.clamp(-1.0, 1.0)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
-
-
-class STE_Dist_Clamp(torch.autograd.Function):
-    """Straight-Through Estimator: dtype-aware distance clamp in forward, identity in backward."""
-    @staticmethod
-    def forward(ctx, x):
-        if x.dtype == torch.float16:
-            return x.clamp(max=11.0)
-        return x.clamp(max=40.0)  # bfloat16 or float32
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
-
 
 class LorentzEmbedding(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden_dim, patch_dim, num_tokens):
@@ -201,8 +178,8 @@ class LorentzMultiHeadAttention(nn.Module):
 
                 raw_Z = numer / denom
 
-                # 8. STE clamp on raw_Z, then diagonal masking
-                Z_clamped = STE_Z_Clamp.apply(raw_Z)
+                # 8. Native clamp on raw_Z, then diagonal masking
+                Z_clamped = raw_Z.clamp(-1.0, 1.0)
                 Z_safe = torch.where(is_self_attn, torch.tensor(1.0, device=Z_clamped.device, dtype=Z_clamped.dtype), Z_clamped)
 
                 # 9. Aperture B
@@ -211,7 +188,7 @@ class LorentzMultiHeadAttention(nn.Module):
 
                 # 10. Scaled Log-Cosh spatial penalty (delta_0 = 15.0)
                 lam = F.softplus(self.lambda_raw)
-                d_L = STE_Dist_Clamp.apply(dist_QK)
+                d_L = dist_QK.clamp(max=40.0)
                 delta_0 = 15.0
                 
                 scaled_d = d_L / delta_0
