@@ -209,11 +209,16 @@ class LorentzMultiHeadAttention(nn.Module):
                 alpha = F.softplus(self.alpha_raw)
                 B = (alpha * c_tilde) / (1.0 + alpha * c_tilde)
 
-                # 10. Log-distance attraction term
+                # 10. Scaled Log-Cosh spatial penalty (delta_0 = 15.0)
                 lam = F.softplus(self.lambda_raw)
                 d_L = STE_Dist_Clamp.apply(dist_QK)
-                log_dist_penalty = -lam * torch.log(1.0 + d_L ** 2)
-
+                delta_0 = 15.0
+                
+                scaled_d = d_L / delta_0
+                log_cosh_dist = scaled_d + F.softplus(-2.0 * scaled_d) - math.log(2.0)
+                
+                log_dist_penalty = -lam * log_cosh_dist 
+                
                 # 11. Margin-Softplus (Phi) entailment penalty — m = 0.1 (fixed)
                 _m = 0.1
                 _softplus_neg_m = F.softplus(torch.tensor(-_m, device=B.device, dtype=B.dtype))
