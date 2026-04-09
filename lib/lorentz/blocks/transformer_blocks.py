@@ -216,28 +216,9 @@ class LorentzMultiHeadAttention(nn.Module):
                 self.haa_mean_B        = B.mean().item()
                 self.haa_mean_Z        = Z_safe.mean().item()
                 self.haa_cone_sparsity = ((B + Z_safe) <= 0).float().mean().item()
-
+                
             else:
-                # ---- Existing tangent-space scoring ----
-
-                # 2. Distanze dall'origine (Norme Iperboliche) con clamp per FP32
-                norm_q = sqrt_k * torch.acosh(torch.clamp_min(q_time / sqrt_k, 1.0 + 1e-7))
-                norm_k = sqrt_k * torch.acosh(torch.clamp_min(k_time / sqrt_k, 1.0 + 1e-7))
-
-                norm_matrix = norm_q @ norm_k.transpose(-1, -2)
-
-                # 3. Coseno dell'angolo
-                dot_space = q_space @ k_space.transpose(-1, -2)
-                norm_q_space = torch.norm(q_space, dim=-1, keepdim=True)
-                norm_k_space = torch.norm(k_space, dim=-1, keepdim=True)
-
-                denom_space = torch.clamp_min(norm_q_space @ norm_k_space.transpose(-1, -2), 1e-8)
-                cos_theta = dot_space / denom_space
-
-                # 4. Score Finale
-                score_matrix = norm_matrix * cos_theta
-                dists = score_matrix * self.scale.expand((b, self.heads, 1, 1))
-
+                dists = -self.manifold.csqdist(q, k) * self.scale.expand((b, self.heads, 1, 1))
                 score = self.softmax(dists / self.temperature)
 
             attn = self.lorentz_expmap_aggregation(v, score).permute(0, 2, 1, 3)
