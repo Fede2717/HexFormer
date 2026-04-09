@@ -226,7 +226,8 @@ class LorentzMultiHeadAttention(nn.Module):
             # Lorentz direct concatenation of heads
             attn_space = attn.narrow(-1, 1, attn.shape[-1]-1).reshape(b, n, -1)
             attn_time = attn.narrow(-1, 0, 1).reshape(b, n, -1)
-            attn_time_rescaled = torch.sqrt(torch.sum(attn_time ** 2, dim=-1, keepdim=True) - ((self.heads - 1) * self.manifold.k))
+            time_sq_arg = torch.sum(attn_time ** 2, dim=-1, keepdim=True) - ((self.heads - 1) * self.manifold.k)
+            attn_time_rescaled = torch.sqrt(time_sq_arg.clamp_min(1e-8))
             attn = torch.concat((attn_time_rescaled, attn_space), dim=-1)
 
             o = self.o(attn)
