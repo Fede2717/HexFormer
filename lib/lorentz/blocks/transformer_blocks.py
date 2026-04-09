@@ -174,7 +174,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 numer = (
                     raw_cosh_QK * cosh_OQ
                     - cosh_OK.transpose(-1, -2)
-                ).to(orig_dtype)
+                )
                 denom = sinh_OQ * sinh_QK
 
                 raw_Z = numer / denom
