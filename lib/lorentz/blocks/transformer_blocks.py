@@ -156,7 +156,7 @@ class LorentzMultiHeadAttention(nn.Module):
 
                 # 4. Safe acosh: feed 2.0 to diagonal to avoid infinite gradient at acosh(1.0)
                 safe_cosh_QK = torch.where(is_self_attn, torch.tensor(2.0, device=raw_cosh_QK.device), raw_cosh_QK)
-                dist_QK = sqrt_k * torch.acosh(safe_cosh_QK)
+                dist_QK = sqrt_k * torch.acosh(safe_cosh_QK).clamp(max=40.0)
 
                 # 5. Origin Distances and Scaled Depths
                 cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
