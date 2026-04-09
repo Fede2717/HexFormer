@@ -232,7 +232,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 self.haa_mean_b_tilde  = b_tilde.mean().item()
                 self.haa_mean_B        = B.mean().item()
                 self.haa_mean_Z        = Z_safe.mean().item()
-                self.haa_cone_sparsity = ((B - Z_safe) <= 0).float().mean().item()
+                self.haa_cone_sparsity = ((B + Z_safe) <= 0).float().mean().item()
 
             else:
                 # ---- Existing tangent-space scoring ----
