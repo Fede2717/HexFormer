@@ -31,7 +31,7 @@ class STE_Dist_Clamp(torch.autograd.Function):
     def forward(ctx, x):
         if x.dtype == torch.float16:
             return x.clamp(max=11.0)
-        return x.clamp(max=80.0)  # bfloat16 or float32
+        return x.clamp(max=40.0)  # bfloat16 or float32
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -183,10 +183,10 @@ class LorentzMultiHeadAttention(nn.Module):
                 # 5. Origin Distances and Scaled Depths
                 cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
                 cosh_OK = (k_time / sqrt_k).clamp_min(1.0 + 1e-7)
-                dist_OQ = (sqrt_k * torch.acosh(cosh_OQ)).clamp(max=80.0)
+                dist_OQ = (sqrt_k * torch.acosh(cosh_OQ)).clamp(max=40.0)
 
                 c_tilde = dist_OQ / sqrt_k
-                b_tilde = (sqrt_k * torch.acosh(cosh_OK)).clamp(max=80.0) / sqrt_k  # telemetry only
+                b_tilde = (sqrt_k * torch.acosh(cosh_OK)).clamp(max=40.0) / sqrt_k  # telemetry only
 
                 # 6. Sinh terms (computed directly, not via sqrt-of-cosh²)
                 sinh_QK = torch.sinh(dist_QK / sqrt_k)
