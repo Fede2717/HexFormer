@@ -217,7 +217,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 # 11. Margin-Softplus (Phi) entailment penalty — m = 0.1 (fixed)
                 _m = 0.1
                 _softplus_neg_m = F.softplus(torch.tensor(-_m, device=B.device, dtype=B.dtype))
-                entailment_penalty = F.softplus((B - Z_safe) - _m) - _softplus_neg_m
+                entailment_penalty = F.softplus((B + Z_safe) - _m) - _softplus_neg_m
 
                 # 12. Final V5 score
                 tau = F.softplus(self.tau_raw)
