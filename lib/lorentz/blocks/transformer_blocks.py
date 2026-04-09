@@ -194,8 +194,8 @@ class LorentzMultiHeadAttention(nn.Module):
 
                 # 7. HLoC Numerator — upcast to FP64 to prevent catastrophic cancellation
                 numer = (
-                    raw_cosh_QK.double() * cosh_OQ.double()
-                    - cosh_OK.transpose(-1, -2).double()
+                    raw_cosh_QK * cosh_OQ
+                    - cosh_OK.transpose(-1, -2)
                 ).to(orig_dtype)
                 denom = sinh_OQ * sinh_QK
 
