@@ -172,9 +172,9 @@ class LorentzMultiHeadAttention(nn.Module):
 
                 # 7. HLoC Numerator 
                 numer = (
-                    raw_cosh_QK * cosh_OQ
-                    - cosh_OK.transpose(-1, -2)
-                )
+                    raw_cosh_QK.double() * cosh_OQ.double()
+                    - cosh_OK.transpose(-1, -2).double()
+                ).to(orig_dtype)
                 denom = sinh_OQ * sinh_QK
 
                 raw_Z = numer / denom
