@@ -170,7 +170,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 sinh_QK = torch.sinh(dist_QK / sqrt_k)
                 sinh_OQ = torch.sinh(c_tilde)
 
-                # 7. HLoC Numerator — upcast to FP64 to prevent catastrophic cancellation
+                # 7. HLoC Numerator 
                 numer = (
                     raw_cosh_QK * cosh_OQ
                     - cosh_OK.transpose(-1, -2)
