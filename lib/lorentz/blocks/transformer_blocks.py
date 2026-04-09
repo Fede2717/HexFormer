@@ -94,8 +94,9 @@ class LorentzMultiHeadAttention(nn.Module):
         self.is_last_layer = is_last_layer
         if is_last_layer:
             self.alpha_raw  = nn.Parameter(torch.zeros(1))
-            self.tau_raw    = nn.Parameter(torch.zeros(1))
-            self.lambda_raw = nn.Parameter(torch.zeros(1))
+            self.tau_raw    = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
+            self.lambda_raw = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
+            init_val = math.log(math.exp(1.0) - 1.0)
             self.haa_alpha         = 0.0
             self.haa_tau           = 0.0
             self.haa_lambda        = 0.0
@@ -204,7 +205,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 # 12. Final V5 score
                 tau = F.softplus(self.tau_raw)
                 score_matrix = log_dist_penalty - tau * entailment_penalty
-                score = self.softmax(score_matrix)
+                score = self.softmax(score_matrix / self.temperature)
 
                 # ---- Telemetry ----
                 self.haa_alpha         = alpha.item()
