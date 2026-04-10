@@ -148,46 +148,42 @@ class LorentzMultiHeadAttention(nn.Module):
                 # 1. Pairwise Lorentz inner product
                 inner_QK = -q_time @ k_time.transpose(-1, -2) + q_space @ k_space.transpose(-1, -2)
 
-                # 2. Raw cosh (clamped >= 1.0 to prevent domain errors)
+                # 2. Spatial Metrics (Required for Log-Cosh Penalty and Aperture)
                 raw_cosh_QK = (-inner_QK / K).clamp_min(1.0)
-
-                # 3. Diagonal/Self-Attention Mask
-                is_self_attn = (raw_cosh_QK < 1.0 + 1e-5)
-
-                # 4. Safe acosh: feed 2.0 to diagonal to avoid infinite gradient at acosh(1.0)
-                safe_cosh_QK = torch.where(is_self_attn, torch.tensor(2.0, device=raw_cosh_QK.device), raw_cosh_QK)
-                dist_QK = sqrt_k * torch.acosh(safe_cosh_QK).clamp(max=40.0)
-
-                # 5. Origin Distances and Scaled Depths
+                dist_QK = sqrt_k * torch.acosh(raw_cosh_QK)
+                
                 cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
-                cosh_OK = (k_time / sqrt_k).clamp_min(1.0 + 1e-7)
-                dist_OQ = (sqrt_k * torch.acosh(cosh_OQ)).clamp(max=40.0)
-
+                dist_OQ = sqrt_k * torch.acosh(cosh_OQ)
                 c_tilde = dist_OQ / sqrt_k
-                b_tilde = (sqrt_k * torch.acosh(cosh_OK)).clamp(max=40.0) / sqrt_k  # telemetry only
+                
+                cosh_OK = (k_time / sqrt_k).clamp_min(1.0 + 1e-7)
+                b_tilde = torch.acosh(cosh_OK) # telemetry only
 
-                # 6. Sinh terms (computed directly, not via sqrt-of-cosh²)
-                sinh_QK = torch.sinh(dist_QK / sqrt_k)
-                sinh_OQ = torch.sinh(c_tilde)
+                # 3. Direct Inner-Product Angle Formulation (Replaces HLoC)
+                inner_OQ = -sqrt_k * q_time                              # Shape: [b,h,n,1]
+                inner_OK = -sqrt_k * k_time.transpose(-1, -2)            # Shape: [b,h,1,n] (Transposed for broadcasting)
 
-                # 7. HLoC Numerator 
-                numer = (
-                    raw_cosh_QK.double() * cosh_OQ.double()
-                    - cosh_OK.transpose(-1, -2).double()
-                ).to(orig_dtype)
-                denom = sinh_OQ * sinh_QK
+                # Squared Lorentz norms of direction vectors
+                norm_sq_QK = (inner_QK.pow(2) / K - K).clamp_min(0.0)    # Shape: [b,h,n,n]
+                norm_sq_OQ = (inner_OQ.pow(2) / K - K).clamp_min(0.0)    # Shape: [b,h,n,1]
 
-                raw_Z = numer / denom
+                # Numerator: Lorentz inner product of the two direction vectors
+                numer_Z = inner_OK + (inner_QK * inner_OQ) / K           # Shape: [b,h,n,n]
 
-                # 8. Native clamp on raw_Z, then diagonal masking
-                Z_clamped = raw_Z.clamp(-1.0, 1.0)
-                Z_safe = torch.where(is_self_attn, torch.tensor(1.0, device=Z_clamped.device, dtype=Z_clamped.dtype), Z_clamped)
+                # Denominator: product of Lorentz norms, regularised
+                EPS_Z = 1e-7
+                denom_Z = torch.sqrt((norm_sq_QK * norm_sq_OQ).clamp_min(EPS_Z ** 2))
 
-                # 9. Aperture B
+                Z_raw = numer_Z / denom_Z
+                
+                # Z_safe naturally goes to ~0.0 for identical tokens, no mask needed
+                Z_safe = Z_raw.clamp(-1.0, 1.0)
+
+                # 4. Aperture B
                 alpha = F.softplus(self.alpha_raw)
                 B = (alpha * c_tilde) / (1.0 + alpha * c_tilde)
-
-                # 10. Scaled Log-Cosh spatial penalty (delta_0 = 15.0)
+                
+                # 5. Scaled Log-Cosh spatial penalty (delta_0 = 15.0)
                 lam = F.softplus(self.lambda_raw)
                 d_L = dist_QK.clamp(max=40.0)
                 delta_0 = 15.0
@@ -197,12 +193,12 @@ class LorentzMultiHeadAttention(nn.Module):
                 
                 log_dist_penalty = -lam * log_cosh_dist 
                 
-                # 11. Margin-Softplus (Phi) entailment penalty — m = 0.1 (fixed)
+                # 6. Margin-Softplus (Phi) entailment penalty — m = 0.1 (fixed)
                 _m = 0.1
                 _softplus_neg_m_val = math.log(1.0 + math.exp(-_m))
                 entailment_penalty = F.softplus((B + Z_safe) - _m) - _softplus_neg_m_val
 
-                # 12. Final V5 score
+                # 7. Final V5 score
                 tau = F.softplus(self.tau_raw)
                 score_matrix = log_dist_penalty - tau * entailment_penalty
                 score = self.softmax(score_matrix / self.temperature)
