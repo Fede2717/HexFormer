@@ -93,10 +93,9 @@ class LorentzMultiHeadAttention(nn.Module):
 
         self.is_last_layer = is_last_layer
         if is_last_layer:
-            self.alpha_raw  = nn.Parameter(torch.zeros(1))
+            self.beta_raw  = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
             self.tau_raw    = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
             self.lambda_raw = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
-            init_val = math.log(math.exp(1.0) - 1.0)
             self.haa_alpha         = 0.0
             self.haa_tau           = 0.0
             self.haa_lambda        = 0.0
@@ -156,10 +155,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 
                 cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
                 dist_OQ = sqrt_k * torch.acosh(cosh_OQ)
-                c_tilde = dist_OQ / sqrt_k
-                
-                cosh_OK = (k_time / sqrt_k).clamp_min(1.0 + 1e-7)
-                b_tilde = torch.acosh(cosh_OK) # telemetry only
+                c_tilde = torch.acosh((q_time / sqrt_k).clamp_min(1.0 + 1e-3))
 
                 # 3. Direct Inner-Product Angle Formulation (Replaces HLoC)
                 inner_OQ = -sqrt_k * q_time                              # Shape: [b,h,n,1]
@@ -173,7 +169,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 numer_Z = inner_OK + (inner_QK * inner_OQ) / K           # Shape: [b,h,n,n]
 
                 # Denominator: product of Lorentz norms, regularised
-                EPS_Z = 1e-7
+                EPS_Z = 5e-3
                 denom_Z = torch.sqrt((norm_sq_QK * norm_sq_OQ).clamp_min(EPS_Z ** 2))
 
                 Z_raw = numer_Z / denom_Z
@@ -181,9 +177,12 @@ class LorentzMultiHeadAttention(nn.Module):
                 # Z_safe naturally goes to ~0.0 for identical tokens, no mask needed
                 Z_safe = Z_raw.clamp(-1.0, 1.0)
 
-                # 4. Aperture B
-                alpha = F.softplus(self.alpha_raw)
-                B = (alpha * c_tilde) / (1.0 + alpha * c_tilde)
+                # 4. Exact Aperture Surrogate B (R2 / Q3 Fix)
+                beta = F.softplus(self.beta_raw)
+                sinh_c = torch.sinh(c_tilde) # c_tilde è già protetto da 1.0+1e-3
+                arg_B = 1.0 - (beta / sinh_c).pow(2)
+                # F.relu e 1e-8 salvano il backward pass da radici di zero o negativi
+                B = torch.sqrt(F.relu(arg_B) + 1e-8)
                 
                 # 5. Scaled Log-Cosh spatial penalty (delta_0 = 15.0)
                 lam = F.softplus(self.lambda_raw)
@@ -191,7 +190,7 @@ class LorentzMultiHeadAttention(nn.Module):
                 d_L_soft = d_max * torch.tanh(dist_QK_raw / d_max)
                 delta_0 = 15.0
                 
-                scaled_d = d_L / delta_0
+                scaled_d = d_L_soft / delta_0
                 log_cosh_dist = scaled_d + F.softplus(-2.0 * scaled_d) - math.log(2.0)
                 
                 log_dist_penalty = -lam * log_cosh_dist 
@@ -214,7 +213,6 @@ class LorentzMultiHeadAttention(nn.Module):
                     self.haa_tau           = tau.item()
                     self.haa_lambda        = lam.item()
                     self.haa_mean_c_tilde  = c_tilde.detach().mean().item()
-                    self.haa_mean_b_tilde  = b_tilde.detach().mean().item()
                     self.haa_mean_B        = B.detach().mean().item()
                     self.haa_mean_Z        = Z_safe.detach().mean().item()
                     self.haa_cone_sparsity = ((B.detach() + Z_safe.detach()) <= 0).float().mean().item()                
