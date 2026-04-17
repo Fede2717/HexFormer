@@ -207,14 +207,14 @@ class LorentzMultiHeadAttention(nn.Module):
                 
                 # ---- Telemetry ----
                 if not self.training:
-                    self.haa_alpha         = alpha.detach()
-                    self.haa_tau           = tau.detach()
-                    self.haa_lambda        = lam.detach()
-                    self.haa_mean_c_tilde  = c_tilde.detach().mean()
-                    self.haa_mean_b_tilde  = b_tilde.detach().mean()
-                    self.haa_mean_B        = B.detach().mean()
-                    self.haa_mean_Z        = Z_safe.detach().mean()
-                    self.haa_cone_sparsity = ((B.detach() + Z_safe.detach()) <= 0).float().mean()                
+                    self.haa_alpha         = alpha.item()
+                    self.haa_tau           = tau.item()
+                    self.haa_lambda        = lam.item()
+                    self.haa_mean_c_tilde  = c_tilde.detach().mean().item()
+                    self.haa_mean_b_tilde  = b_tilde.detach().mean().item()
+                    self.haa_mean_B        = B.detach().mean().item()
+                    self.haa_mean_Z        = Z_safe.detach().mean().item()
+                    self.haa_cone_sparsity = ((B.detach() + Z_safe.detach()) <= 0).float().mean().item()                
             else:
                 dists = -self.manifold.csqdist(q, k) * self.scale.expand((b, self.heads, 1, 1))
                 score = self.softmax(dists / self.temperature)
