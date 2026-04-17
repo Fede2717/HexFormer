@@ -149,8 +149,10 @@ class LorentzMultiHeadAttention(nn.Module):
                 inner_QK = -q_time @ k_time.transpose(-1, -2) + q_space @ k_space.transpose(-1, -2)
 
                 # 2. Spatial Metrics (Required for Log-Cosh Penalty and Aperture)
+                ACOSH_EPS = 1e-3
                 raw_cosh_QK = (-inner_QK / K).clamp_min(1.0)
-                dist_QK = sqrt_k * torch.acosh(raw_cosh_QK)
+                safe_cosh_for_dist = (-inner_QK / K).clamp_min(1.0 + ACOSH_EPS)
+                dist_QK_raw = sqrt_k * torch.acosh(safe_cosh_for_dist)
                 
                 cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
                 dist_OQ = sqrt_k * torch.acosh(cosh_OQ)
@@ -185,7 +187,8 @@ class LorentzMultiHeadAttention(nn.Module):
                 
                 # 5. Scaled Log-Cosh spatial penalty (delta_0 = 15.0)
                 lam = F.softplus(self.lambda_raw)
-                d_L = dist_QK.clamp(max=40.0)
+                d_max = 40.0
+                d_L_soft = d_max * torch.tanh(dist_QK_raw / d_max)
                 delta_0 = 15.0
                 
                 scaled_d = d_L / delta_0
