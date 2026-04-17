@@ -195,6 +195,8 @@ class LorentzMultiHeadAttention(nn.Module):
                 
                 # 6. Margin-Softplus (Phi) entailment penalty — m = 0.1 (fixed)
                 _m = 0.1
+                # WARNING: If _m is ever promoted to a learnable parameter, this precomputation 
+                # must be removed and replaced with F.softplus(-_m) to restore the gradient graph.
                 _softplus_neg_m_val = math.log(1.0 + math.exp(-_m))
                 entailment_penalty = F.softplus((B + Z_safe) - _m) - _softplus_neg_m_val
 
