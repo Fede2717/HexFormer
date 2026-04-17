@@ -142,19 +142,15 @@ class LorentzMultiHeadAttention(nn.Module):
 
             if self.is_last_layer:
                 # ---- HAA V5 Scoring ----
-                orig_dtype = q_time.dtype
 
                 # 1. Pairwise Lorentz inner product
                 inner_QK = -q_time @ k_time.transpose(-1, -2) + q_space @ k_space.transpose(-1, -2)
 
                 # 2. Spatial Metrics (Required for Log-Cosh Penalty and Aperture)
                 ACOSH_EPS = 1e-3
-                raw_cosh_QK = (-inner_QK / K).clamp_min(1.0)
                 safe_cosh_for_dist = (-inner_QK / K).clamp_min(1.0 + ACOSH_EPS)
                 dist_QK_raw = sqrt_k * torch.acosh(safe_cosh_for_dist)
                 
-                cosh_OQ = (q_time / sqrt_k).clamp_min(1.0 + 1e-7)
-                dist_OQ = sqrt_k * torch.acosh(cosh_OQ)
                 c_tilde = torch.acosh((q_time / sqrt_k).clamp_min(1.0 + 1e-3))
 
                 # 3. Direct Inner-Product Angle Formulation (Replaces HLoC)
@@ -209,13 +205,13 @@ class LorentzMultiHeadAttention(nn.Module):
                 
                 # ---- Telemetry ----
                 if not self.training:
-                    self.haa_alpha         = alpha.item()
+                    self.haa_alpha         = beta.item()   
                     self.haa_tau           = tau.item()
                     self.haa_lambda        = lam.item()
-                    self.haa_mean_c_tilde  = c_tilde.detach().mean().item()
-                    self.haa_mean_B        = B.detach().mean().item()
-                    self.haa_mean_Z        = Z_safe.detach().mean().item()
-                    self.haa_cone_sparsity = ((B.detach() + Z_safe.detach()) <= 0).float().mean().item()                
+                    self.haa_mean_c_tilde  = c_tilde.mean().item()
+                    self.haa_mean_B        = B.mean().item()
+                    self.haa_mean_Z        = Z_safe.mean().item()
+                    self.haa_cone_sparsity = ((B + Z_safe) <= 0).float().mean().item()              
             else:
                 dists = -self.manifold.csqdist(q, k) * self.scale.expand((b, self.heads, 1, 1))
                 score = self.softmax(dists / self.temperature)
