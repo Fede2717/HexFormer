@@ -165,10 +165,10 @@ def select_dataset(args, validation_split=False):
             transforms.Normalize(mean, std),
         ])
 
-        train_set = datasets.CIFAR10('data', train=True, download=True, transform=train_transform)
+        train_set = datasets.CIFAR10('/media/pinas/datasets/', train=True, download=True, transform=train_transform)
         if validation_split:
             train_set, val_set = torch.utils.data.random_split(train_set, [40000, 10000], generator=torch.Generator().manual_seed(1))
-        test_set = datasets.CIFAR10('data', train=False, download=False, transform=test_transform)
+        test_set = datasets.CIFAR10('/media/pinas/datasets/', train=False, download=False, transform=test_transform)
 
         img_dim = [3, 32, 32]
         num_classes = 10
@@ -191,10 +191,10 @@ def select_dataset(args, validation_split=False):
             transforms.Normalize(mean, std),
         ])
 
-        train_set = datasets.CIFAR100('data', train=True, download=True, transform=train_transform)
+        train_set = datasets.CIFAR100('/media/pinas/datasets/', train=True, download=True, transform=train_transform)
         if validation_split:
             train_set, val_set = torch.utils.data.random_split(train_set, [40000, 10000], generator=torch.Generator().manual_seed(1))
-        test_set = datasets.CIFAR100('data', train=False, download=False, transform=test_transform)
+        test_set = datasets.CIFAR100('/media/pinas/datasets/', train=False, download=False, transform=test_transform)
 
         img_dim = [3, 32, 32]
         num_classes = 100

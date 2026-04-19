@@ -25,6 +25,8 @@ from lib.utils.utils import AverageMeter, accuracy
 from lib.utils.mix import cutmix_data, mixup_data, mixup_criterion
 from lib.utils.losses import LabelSmoothingCrossEntropy
 
+os.environ['WANDB_DIR'] = '/media/hdd/usr/forner/wandb/'
+
 
 def getArguments():
     """ Parses command-line options. """
@@ -167,7 +169,7 @@ def main(args):
     # Initialize TensorBoard writer
     # Set up TensorBoard logging directory with a unique name for each experiment
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = os.path.join(args.output_dir, "tensorboard_logs", args.exp_name + "_" + timestamp)
+    log_dir = os.path.join("/media/hdd/usr/forner/logs/", args.exp_name + "_" + timestamp)
     writer = SummaryWriter(log_dir=log_dir)
 
 
