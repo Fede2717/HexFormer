@@ -24,6 +24,7 @@ from utils.initialize import select_dataset, select_model, select_optimizer, loa
 from lib.utils.utils import AverageMeter, accuracy
 from lib.utils.mix import cutmix_data, mixup_data, mixup_criterion
 from lib.utils.losses import LabelSmoothingCrossEntropy
+from haa_diagnostics import log_haa_epoch_metrics, log_haa_deep_diagnostics
 
 os.environ['WANDB_DIR'] = '/media/hdd/usr/forner/wandb/'
 
@@ -113,6 +114,11 @@ def getArguments():
                         choices=["CIFAR-10", "CIFAR-100", "Tiny-ImageNet", "ImageNet"],
                         help="Select a dataset.")
 
+    # HAA ablation mode
+    parser.add_argument('--haa_mode', default='baseline', type=str,
+                        choices=['baseline', 'terminal', 'full_uniform'],
+                        help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers.")
+
     args = parser.parse_args()
 
     return args
@@ -129,7 +135,15 @@ def main(args):
     for key, value in model_configs[args.model_size].items():
         if getattr(args, key) is None:
             setattr(args, key, value)
-            
+
+    # Map --haa_mode to the list of layer indices where HAA scoring is active
+    _haa_mode_map = {
+        'baseline':     [],
+        'terminal':     [args.num_layers - 1],
+        'full_uniform': list(range(args.num_layers)),
+    }
+    args.active_haa_layers = _haa_mode_map[args.haa_mode]
+
     device = args.device[0]
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
@@ -278,6 +292,9 @@ def main(args):
             writer.add_scalar('Accuracy/val_top1', acc1_val, epoch)
             writer.add_scalar('Accuracy/val_top5', acc5_val, epoch)
 
+            # Log per-layer HAA telemetry (reads values stored during evaluate())
+            log_haa_epoch_metrics(model, epoch, writer)
+
             # Append the validation metrics for this epoch
             val_losses.append(loss_val)
             val_acc1s.append(acc1_val)
@@ -288,7 +305,7 @@ def main(args):
                 best_acc = acc1_val
                 best_epoch = epoch + 1
                 if args.output_dir is not None:
-                    save_path = args.output_dir + "/best_" + args.exp_name + ".pth"
+                    save_path = os.path.join(args.output_dir, f"best_{args.exp_name}_haa_{args.haa_mode}.pth")
                     torch.save({
                         'model': model.module.state_dict(),
                         'optimizer': optimizer.state_dict(),
@@ -296,13 +313,19 @@ def main(args):
                         'epoch': epoch,
                         'args': args,
                     }, save_path)
+
+        # Deep diagnostics at epochs 1, 5, 10, 20, and the final epoch
+        _deep_epochs = {1, 5, 10, 20}
+        if (epoch + 1) in _deep_epochs or (epoch + 1) == args.num_epochs:
+            _K = model.module.enc_manifold.k.item()
+            log_haa_deep_diagnostics(model, val_loader, device, epoch, _K, writer)
         # ------- End validation and logging -------
 
     print("-----------------\nTraining finished\n-----------------")
     print("Best epoch = {}, with Acc@1={:.4f}".format(best_epoch, best_acc))
 
     if args.output_dir is not None:
-        save_path = args.output_dir + "/final_" + args.exp_name + ".pth"
+        save_path = os.path.join(args.output_dir, f"final_{args.exp_name}_haa_{args.haa_mode}.pth")
         torch.save({
             'model': model.module.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -313,7 +336,7 @@ def main(args):
         print("Model saved to " + save_path)
 
         # Save metrics to CSV
-        metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_metrics.csv")
+        metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_haa_{args.haa_mode}_metrics.csv")
         with open(metrics_file, mode='w', newline='') as file:
             writer_csv = csv.writer(file)
             writer_csv.writerow(["Epoch", "Train Loss", "Val Loss", "Train Acc@1", "Val Acc@1", "Train Acc@5", "Val Acc@5"])
@@ -322,7 +345,7 @@ def main(args):
         print(f"Metrics saved to {metrics_file}")
 
         # Save best accuracy and epoch to a text file
-        best_metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_best_metrics.txt")
+        best_metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_haa_{args.haa_mode}_best_metrics.txt")
         with open(best_metrics_file, mode='w') as file:
             file.write(f"Best Epoch: {best_epoch}\n")
             file.write(f"Best Accuracy@1: {best_acc:.4f}\n\n")
@@ -340,7 +363,7 @@ def main(args):
     print("Testing best model...")
     if args.output_dir is not None:
         print("Loading best model...")
-        save_path = args.output_dir + "/best_" + args.exp_name + ".pth"
+        save_path = os.path.join(args.output_dir, f"best_{args.exp_name}_haa_{args.haa_mode}.pth")
         checkpoint = torch.load(save_path, map_location=device)
         model.module.load_state_dict(checkpoint['model'], strict=True)
 

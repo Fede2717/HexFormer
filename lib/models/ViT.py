@@ -16,12 +16,7 @@ def init_weights(m):
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
     elif isinstance(m, (LorentzFullyConnected)):
-        # gain = nn.init.calculate_gain('leaky_relu', param=0.25)
-        #nn.init.orthogonal_(m.weight.weight)
-        # nn.init.kaiming_normal_(m.weight.weight, a=0.1, mode='fan_in', nonlinearity='leaky_relu')
-        nn.init.xavier_normal_(m.weight.weight) # Tanh 5/3 #LR math.sqrt((2)/(1+(0.2**2)))=1.386 # math.sqrt(2) GELU
-        # He initialization for LorentzFullyConnected layers
-        # nn.init.kaiming_uniform_(m.weight.weight, a=math.sqrt(5))
+        nn.init.xavier_normal_(m.weight.weight)
         if m.weight.bias is not None:
             nn.init.constant_(m.weight.bias, 0)
     elif isinstance(m, nn.LayerNorm):
@@ -40,10 +35,14 @@ class ViT(nn.Module):
         hidden_dim=192,
         mlp_dim=384,
         dropout=0.0,
-        remove_linear=False
+        remove_linear=False,
+        active_haa_layers=None,
     ):
         super(ViT, self).__init__()
         self.manifold = manifold
+
+        if active_haa_layers is None:
+            active_haa_layers = []
 
         c,h,w = img_dim
 
@@ -57,7 +56,15 @@ class ViT(nn.Module):
 
         self.embed = self._get_embedding()
 
-        enc_list = [self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout) for _ in range(num_layers)]
+        max_haa_idx = max(active_haa_layers) if active_haa_layers else num_layers - 1
+        enc_list = []
+        for idx in range(num_layers):
+            use_haa = (idx in active_haa_layers)
+            layer = self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout, use_haa=use_haa)
+            if hasattr(layer, 'mha'):
+                layer.mha.layer_idx = idx
+                layer.mha.max_layer_idx = max_haa_idx
+            enc_list.append(layer)
         self.encoder = nn.Sequential(*enc_list)
 
         self.final_ln = self._get_layerNorm(hidden_dim)
@@ -86,7 +93,7 @@ class ViT(nn.Module):
         out = out.reshape(x.size(0), self.num_patches, -1)
 
         return out
-    
+
     def _get_embedding(self):
         if self.manifold is None:
             return Embedding(self.hidden_dim, self.patch_dim, self.num_tokens)
@@ -96,17 +103,17 @@ class ViT(nn.Module):
 
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
-    
-    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout):
+
+    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False):
         if self.manifold is None:
             return TransformerEncoder(hidden_dim, mlp_dim, num_patches, heads, dropout)
 
         elif type(self.manifold) is CustomLorentz:
-            return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout)
+            return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout, use_haa=use_haa)
 
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
-    
+
     def _get_layerNorm(self, num_features):
         if self.manifold is None:
             return nn.LayerNorm(num_features)
@@ -126,7 +133,7 @@ class ViT(nn.Module):
 
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
-    
+
 
 def vit(**kwargs):
     " Constructs a Vision Transformer (ViT) "

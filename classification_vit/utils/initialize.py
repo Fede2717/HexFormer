@@ -58,6 +58,7 @@ def select_model(img_dim, num_classes, args):
         'heads' : args.num_heads,
         'hidden_dim' : args.hidden_dim,
         'mlp_dim' : args.mlp_dim,
+        'active_haa_layers' : getattr(args, 'active_haa_layers', []),
     }
 
     if (args.encoder_manifold=="lorentz") or (args.encoder_manifold=="poincare"):
