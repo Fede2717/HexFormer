@@ -118,6 +118,9 @@ def getArguments():
     parser.add_argument('--haa_mode', default='baseline', type=str,
                         choices=['baseline', 'terminal', 'full_uniform'],
                         help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers.")
+    parser.add_argument('--deep_diagnostics', action='store_true',
+        help="Run extra val pass at epochs {1,5,10,20,final} for geometric diagnostics. "
+             "Disable for RNG-clean training runs.")
 
     args = parser.parse_args()
 
@@ -197,6 +200,27 @@ def main(args):
 
     best_acc = 0.0
     best_epoch = 0
+
+    from lib.lorentz.blocks.transformer_blocks import LorentzMultiHeadAttention
+    _base = model.module if hasattr(model, 'module') else model
+    _haa_layers = sorted(
+        [(m.layer_idx, m)
+         for _, m in _base.named_modules()
+         if isinstance(m, LorentzMultiHeadAttention) and m.use_haa],
+        key=lambda x: x[0]
+    )
+    # Collect per-epoch HAA scalars — use last HAA layer only for CSV
+    # (full per-layer data remains in TensorBoard)
+    _haa_epoch_data = {
+        'beta':             [],
+        'tau':              [],
+        'lambda':           [],
+        'cone_sparsity':    [],
+        'z_mean':           [],
+        'frac_near_origin': [],
+        'grad_norm_B':      [],
+        'grad_norm_c_tilde':[],
+    }
 
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
@@ -295,6 +319,18 @@ def main(args):
             # Log per-layer HAA telemetry (reads values stored during evaluate())
             log_haa_epoch_metrics(model, epoch, writer)
 
+            # Collect HAA scalars from the last HAA layer for CSV
+            if _haa_layers:
+                _, _last_mha = _haa_layers[-1]
+                _haa_epoch_data['beta'].append(_last_mha.haa_alpha)
+                _haa_epoch_data['tau'].append(_last_mha.haa_tau)
+                _haa_epoch_data['lambda'].append(_last_mha.haa_lambda)
+                _haa_epoch_data['cone_sparsity'].append(_last_mha.haa_cone_sparsity)
+                _haa_epoch_data['z_mean'].append(_last_mha.haa_mean_Z)
+                _haa_epoch_data['frac_near_origin'].append(_last_mha.haa_frac_near_origin)
+                _haa_epoch_data['grad_norm_B'].append(_last_mha._grad_norms.get('B', ''))
+                _haa_epoch_data['grad_norm_c_tilde'].append(_last_mha._grad_norms.get('c_tilde', ''))
+
             # Append the validation metrics for this epoch
             val_losses.append(loss_val)
             val_acc1s.append(acc1_val)
@@ -315,8 +351,8 @@ def main(args):
                     }, save_path)
 
         # Deep diagnostics at epochs 1, 5, 10, 20, and the final epoch
-        _deep_epochs = {1, 5, 10, 20}
-        if (epoch + 1) in _deep_epochs or (epoch + 1) == args.num_epochs:
+        if args.deep_diagnostics and ((epoch+1) in {1,5,10,20}
+                                       or (epoch+1) == args.num_epochs):
             _K = model.module.enc_manifold.k.item()
             log_haa_deep_diagnostics(model, val_loader, device, epoch, _K, writer)
         # ------- End validation and logging -------
@@ -339,9 +375,31 @@ def main(args):
         metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_haa_{args.haa_mode}_metrics.csv")
         with open(metrics_file, mode='w', newline='') as file:
             writer_csv = csv.writer(file)
-            writer_csv.writerow(["Epoch", "Train Loss", "Val Loss", "Train Acc@1", "Val Acc@1", "Train Acc@5", "Val Acc@5"])
+            writer_csv.writerow([
+                "Epoch",
+                "Train Loss", "Val Loss",
+                "Train Acc@1", "Val Acc@1",
+                "Train Acc@5", "Val Acc@5",
+                "haa_beta", "haa_tau", "haa_lambda",
+                "haa_cone_sparsity", "haa_z_mean",
+                "haa_frac_near_origin",
+                "haa_grad_norm_B", "haa_grad_norm_c_tilde",
+            ])
             for i in range(args.num_epochs):
-                writer_csv.writerow([i+1, train_losses[i], val_losses[i], train_acc1s[i], val_acc1s[i], train_acc5s[i], val_acc5s[i]])
+                writer_csv.writerow([
+                    i+1,
+                    train_losses[i], val_losses[i],
+                    train_acc1s[i], val_acc1s[i],
+                    train_acc5s[i], val_acc5s[i],
+                    _haa_epoch_data['beta'][i]             if i < len(_haa_epoch_data['beta']) else '',
+                    _haa_epoch_data['tau'][i]              if i < len(_haa_epoch_data['tau']) else '',
+                    _haa_epoch_data['lambda'][i]           if i < len(_haa_epoch_data['lambda']) else '',
+                    _haa_epoch_data['cone_sparsity'][i]    if i < len(_haa_epoch_data['cone_sparsity']) else '',
+                    _haa_epoch_data['z_mean'][i]           if i < len(_haa_epoch_data['z_mean']) else '',
+                    _haa_epoch_data['frac_near_origin'][i] if i < len(_haa_epoch_data['frac_near_origin']) else '',
+                    _haa_epoch_data['grad_norm_B'][i]      if i < len(_haa_epoch_data['grad_norm_B']) else '',
+                    _haa_epoch_data['grad_norm_c_tilde'][i] if i < len(_haa_epoch_data['grad_norm_c_tilde']) else '',
+                ])
         print(f"Metrics saved to {metrics_file}")
 
         # Save best accuracy and epoch to a text file
