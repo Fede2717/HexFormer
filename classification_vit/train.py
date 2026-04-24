@@ -116,8 +116,8 @@ def getArguments():
 
     # HAA ablation mode
     parser.add_argument('--haa_mode', default='baseline', type=str,
-                        choices=['baseline', 'terminal', 'full_uniform'],
-                        help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers.")
+                        choices=['baseline', 'terminal', 'full_uniform', 'continuous'],
+                        help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers, continuous=all layers with depth-proportional beta init.")
     parser.add_argument('--deep_diagnostics', action='store_true',
         help="Run extra val pass at epochs {1,5,10,20,final} for geometric diagnostics. "
              "Disable for RNG-clean training runs.")
@@ -144,8 +144,10 @@ def main(args):
         'baseline':     [],
         'terminal':     [args.num_layers - 1],
         'full_uniform': list(range(args.num_layers)),
+        'continuous':   list(range(args.num_layers)),
     }
     args.active_haa_layers = _haa_mode_map[args.haa_mode]
+    args.beta_proportional = (args.haa_mode == 'continuous')
 
     device = args.device[0]
     torch.cuda.set_device(device)

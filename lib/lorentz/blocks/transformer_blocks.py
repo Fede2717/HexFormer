@@ -39,7 +39,7 @@ class LorentzEmbedding(nn.Module):
 
 class LorentzTransformerEncoder(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout,
-                 stochastic_depth=0.1, use_haa=False):
+                 stochastic_depth=0.1, use_haa=False, beta_init_val=None):
         super(LorentzTransformerEncoder, self).__init__()
 
         self.manifold = manifold
@@ -51,7 +51,7 @@ class LorentzTransformerEncoder(nn.Module):
         self.dropout = dropout
 
         self.ln1 = LorentzLayerNorm(manifold, hidden)
-        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa)
+        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val)
         self.ln2 = LorentzLayerNorm(manifold, hidden)
         self.mlp = nn.Sequential(
             LorentzFullyConnected(manifold, hidden, mlp_hidden, activation=nn.GELU(), dropout=dropout),
@@ -70,7 +70,7 @@ class LorentzTransformerEncoder(nn.Module):
 
 class LorentzMultiHeadAttention(nn.Module):
     def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0,
-                 learn_scale=False, use_haa=False):
+                 learn_scale=False, use_haa=False, beta_init_val=None):
         super(LorentzMultiHeadAttention, self).__init__()
 
         self.manifold = manifold
@@ -98,7 +98,13 @@ class LorentzMultiHeadAttention(nn.Module):
         if use_haa:
             # τ₀=0.1: Phase 0 showed z_mean≈+0.80 everywhere; low τ lets spatial
             # penalty (which varies across pairs) dominate early training.
-            self.beta_raw   = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
+            if beta_init_val is not None and beta_init_val > 1e-6:
+                _beta_raw_init = math.log(math.exp(beta_init_val) - 1.0)
+            elif beta_init_val is not None:
+                _beta_raw_init = -10.0   # softplus(-10) ≈ 4.5e-5 ≈ 0
+            else:
+                _beta_raw_init = math.log(math.exp(1.0) - 1.0)
+            self.beta_raw   = nn.Parameter(torch.tensor([_beta_raw_init]))
             self.tau_raw    = nn.Parameter(torch.tensor([math.log(math.exp(0.1) - 1.0)]))
             self.lambda_raw = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
 

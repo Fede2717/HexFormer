@@ -37,6 +37,7 @@ class ViT(nn.Module):
         dropout=0.0,
         remove_linear=False,
         active_haa_layers=None,
+        beta_proportional=False,
     ):
         super(ViT, self).__init__()
         self.manifold = manifold
@@ -60,7 +61,13 @@ class ViT(nn.Module):
         enc_list = []
         for idx in range(num_layers):
             use_haa = (idx in active_haa_layers)
-            layer = self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout, use_haa=use_haa)
+            if beta_proportional:
+                _beta_max = 1.0
+                _beta_val = _beta_max * idx / max(num_layers - 1, 1)
+                _beta_init = _beta_val
+            else:
+                _beta_init = None
+            layer = self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout, use_haa=use_haa, beta_init_val=_beta_init)
             if hasattr(layer, 'mha'):
                 layer.mha.layer_idx = idx
                 layer.mha.max_layer_idx = max_haa_idx
@@ -104,12 +111,12 @@ class ViT(nn.Module):
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
 
-    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False):
+    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False, beta_init_val=None):
         if self.manifold is None:
             return TransformerEncoder(hidden_dim, mlp_dim, num_patches, heads, dropout)
 
         elif type(self.manifold) is CustomLorentz:
-            return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout, use_haa=use_haa)
+            return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val)
 
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
