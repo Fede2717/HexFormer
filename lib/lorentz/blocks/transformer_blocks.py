@@ -39,7 +39,8 @@ class LorentzEmbedding(nn.Module):
 
 class LorentzTransformerEncoder(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout,
-                 stochastic_depth=0.1, use_haa=False, beta_init_val=None):
+                 stochastic_depth=0.1, use_haa=False, beta_init_val=None,
+                 tau_init=0.1, lambda_init=1.0):
         super(LorentzTransformerEncoder, self).__init__()
 
         self.manifold = manifold
@@ -51,7 +52,7 @@ class LorentzTransformerEncoder(nn.Module):
         self.dropout = dropout
 
         self.ln1 = LorentzLayerNorm(manifold, hidden)
-        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val)
+        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init)
         self.ln2 = LorentzLayerNorm(manifold, hidden)
         self.mlp = nn.Sequential(
             LorentzFullyConnected(manifold, hidden, mlp_hidden, activation=nn.GELU(), dropout=dropout),
@@ -70,7 +71,8 @@ class LorentzTransformerEncoder(nn.Module):
 
 class LorentzMultiHeadAttention(nn.Module):
     def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0,
-                 learn_scale=False, use_haa=False, beta_init_val=None):
+                 learn_scale=False, use_haa=False, beta_init_val=None,
+                 tau_init=0.1, lambda_init=1.0):
         super(LorentzMultiHeadAttention, self).__init__()
 
         self.manifold = manifold
@@ -105,8 +107,8 @@ class LorentzMultiHeadAttention(nn.Module):
             else:
                 _beta_raw_init = math.log(math.exp(1.0) - 1.0)
             self.beta_raw   = nn.Parameter(torch.tensor([_beta_raw_init]))
-            self.tau_raw    = nn.Parameter(torch.tensor([math.log(math.exp(0.1) - 1.0)]))
-            self.lambda_raw = nn.Parameter(torch.tensor([math.log(math.exp(1.0) - 1.0)]))
+            self.tau_raw    = nn.Parameter(torch.tensor([math.log(math.exp(tau_init) - 1.0)]))
+            self.lambda_raw = nn.Parameter(torch.tensor([math.log(math.exp(lambda_init) - 1.0)]))
 
             self.haa_alpha            = 0.0
             self.haa_tau              = 0.0

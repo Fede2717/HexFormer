@@ -61,6 +61,8 @@ def select_model(img_dim, num_classes, args):
         'active_haa_layers'  : getattr(args, 'active_haa_layers', []),
         'beta_proportional'  : getattr(args, 'beta_proportional', False),
     }
+    enc_args['tau_init']    = getattr(args, 'haa_tau_init',    0.1)
+    enc_args['lambda_init'] = getattr(args, 'haa_lambda_init', 1.0)
 
     if (args.encoder_manifold=="lorentz") or (args.encoder_manifold=="poincare"):
         enc_args['learn_k'] = args.learn_k

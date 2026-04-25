@@ -116,8 +116,12 @@ def getArguments():
 
     # HAA ablation mode
     parser.add_argument('--haa_mode', default='baseline', type=str,
-                        choices=['baseline', 'terminal', 'full_uniform', 'continuous'],
-                        help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers, continuous=all layers with depth-proportional beta init.")
+                        choices=['baseline', 'terminal', 'full_uniform', 'continuous', 'terminal_aggressive'],
+                        help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers, continuous=all layers with depth-proportional beta init, terminal_aggressive=last layer with high tau/low lambda.")
+    parser.add_argument('--haa_tau_init', default=0.1, type=float,
+        help="Initial tau value for HAA entailment weight. Default 0.1. Use 3.0 for terminal_aggressive.")
+    parser.add_argument('--haa_lambda_init', default=1.0, type=float,
+        help="Initial lambda value for HAA spatial weight. Default 1.0. Use 0.3 for terminal_aggressive.")
     parser.add_argument('--deep_diagnostics', action='store_true',
         help="Run extra val pass at epochs {1,5,10,20,final} for geometric diagnostics. "
              "Disable for RNG-clean training runs.")
@@ -141,13 +145,20 @@ def main(args):
 
     # Map --haa_mode to the list of layer indices where HAA scoring is active
     _haa_mode_map = {
-        'baseline':     [],
-        'terminal':     [args.num_layers - 1],
-        'full_uniform': list(range(args.num_layers)),
-        'continuous':   list(range(args.num_layers)),
+        'baseline':             [],
+        'terminal':             [args.num_layers - 1],
+        'full_uniform':         list(range(args.num_layers)),
+        'continuous':           list(range(args.num_layers)),
+        'terminal_aggressive':  [args.num_layers - 1],
     }
     args.active_haa_layers = _haa_mode_map[args.haa_mode]
     args.beta_proportional = (args.haa_mode == 'continuous')
+
+    if args.haa_mode == 'terminal_aggressive':
+        if args.haa_tau_init == 0.1:
+            args.haa_tau_init = 3.0
+        if args.haa_lambda_init == 1.0:
+            args.haa_lambda_init = 0.3
 
     device = args.device[0]
     torch.cuda.set_device(device)
@@ -185,10 +196,21 @@ def main(args):
     if args.compile:
         model = torch.compile(model)
 
+    # Build a self-identifying experiment name that embeds the HAA mode
+    if args.haa_mode != 'baseline':
+        _suffix = args.haa_mode
+        if args.haa_mode == 'terminal_aggressive':
+            _suffix = (f"terminal_aggressive"
+                       f"_tau{args.haa_tau_init}"
+                       f"_lam{args.haa_lambda_init}")
+        _run_exp_name = args.exp_name + "_haa_" + _suffix
+    else:
+        _run_exp_name = args.exp_name
+
     # Initialize TensorBoard writer
     # Set up TensorBoard logging directory with a unique name for each experiment
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = os.path.join("/media/hdd/usr/forner/logs/", args.exp_name + "_" + timestamp)
+    log_dir = os.path.join("/media/hdd/usr/forner/logs/", _run_exp_name + "_" + timestamp)
     writer = SummaryWriter(log_dir=log_dir)
 
 
@@ -343,7 +365,7 @@ def main(args):
                 best_acc = acc1_val
                 best_epoch = epoch + 1
                 if args.output_dir is not None:
-                    save_path = os.path.join(args.output_dir, f"best_{args.exp_name}_haa_{args.haa_mode}.pth")
+                    save_path = os.path.join(args.output_dir, f"best_{_run_exp_name}.pth")
                     torch.save({
                         'model': model.module.state_dict(),
                         'optimizer': optimizer.state_dict(),
@@ -363,7 +385,7 @@ def main(args):
     print("Best epoch = {}, with Acc@1={:.4f}".format(best_epoch, best_acc))
 
     if args.output_dir is not None:
-        save_path = os.path.join(args.output_dir, f"final_{args.exp_name}_haa_{args.haa_mode}.pth")
+        save_path = os.path.join(args.output_dir, f"final_{_run_exp_name}.pth")
         torch.save({
             'model': model.module.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -374,7 +396,7 @@ def main(args):
         print("Model saved to " + save_path)
 
         # Save metrics to CSV
-        metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_haa_{args.haa_mode}_metrics.csv")
+        metrics_file = os.path.join(args.output_dir, f"{_run_exp_name}_metrics.csv")
         with open(metrics_file, mode='w', newline='') as file:
             writer_csv = csv.writer(file)
             writer_csv.writerow([
@@ -405,7 +427,7 @@ def main(args):
         print(f"Metrics saved to {metrics_file}")
 
         # Save best accuracy and epoch to a text file
-        best_metrics_file = os.path.join(args.output_dir, f"{args.exp_name}_haa_{args.haa_mode}_best_metrics.txt")
+        best_metrics_file = os.path.join(args.output_dir, f"{_run_exp_name}_best_metrics.txt")
         with open(best_metrics_file, mode='w') as file:
             file.write(f"Best Epoch: {best_epoch}\n")
             file.write(f"Best Accuracy@1: {best_acc:.4f}\n\n")
@@ -423,7 +445,7 @@ def main(args):
     print("Testing best model...")
     if args.output_dir is not None:
         print("Loading best model...")
-        save_path = os.path.join(args.output_dir, f"best_{args.exp_name}_haa_{args.haa_mode}.pth")
+        save_path = os.path.join(args.output_dir, f"best_{_run_exp_name}.pth")
         checkpoint = torch.load(save_path, map_location=device)
         model.module.load_state_dict(checkpoint['model'], strict=True)
 
