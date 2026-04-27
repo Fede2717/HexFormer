@@ -183,6 +183,12 @@ def log_haa_epoch_metrics(model, epoch: int, writer) -> None:
                         f"[HAA layer {l}] grad_norm_{param_name}={norm_val:.3e} "
                         f"outside expected range [1e-3, 1e0]")
 
+        # STEP 0 Action C: z_nan_element_rate — log and reset per epoch.
+        elem_rate = mha._z_nan_element_count / max(1, mha._z_nan_element_total)
+        log_fn(f"haa/layer_{l}/z_nan_element_rate", elem_rate)
+        mha._z_nan_element_count = 0
+        mha._z_nan_element_total = 0
+
 
 def log_haa_deep_diagnostics(model, val_loader, device: str,
                               epoch: int, K: float, writer) -> None:

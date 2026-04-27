@@ -76,6 +76,21 @@ class ViT(nn.Module):
             enc_list.append(layer)
         self.encoder = nn.Sequential(*enc_list)
 
+        # STEP 0 Action B: Verify layer_idx assignment for all HAA layers.
+        if active_haa_layers:
+            n_haa = sum(1 for blk in self.encoder
+                        if hasattr(blk, 'mha') and blk.mha.use_haa)
+            assert n_haa > 0, "No HAA layers found despite non-empty active_haa_layers"
+            for i, blk in enumerate(self.encoder):
+                if hasattr(blk, 'mha') and blk.mha.use_haa:
+                    assert blk.mha.layer_idx >= 0, \
+                        f"Block {i}: layer_idx not assigned (still -1)"
+                    assert blk.mha.max_layer_idx == max(active_haa_layers), \
+                        (f"Block {i}: max_layer_idx={blk.mha.max_layer_idx}, "
+                         f"expected {max(active_haa_layers)}")
+            print(f"[HAA INIT] Verified {n_haa} HAA layers with valid layer_idx assignment.",
+                  flush=True)
+
         self.final_ln = self._get_layerNorm(hidden_dim)
 
         if remove_linear:

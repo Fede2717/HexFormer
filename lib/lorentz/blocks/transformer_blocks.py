@@ -119,6 +119,12 @@ class LorentzMultiHeadAttention(nn.Module):
             self.haa_cone_sparsity    = 0.0
             self.haa_frac_near_origin = 0.0
 
+            # NaN counters for Z telemetry (STEP 0 Action A / Item 8)
+            self._z_nan_batch_count   = 0
+            self._z_nan_total_calls   = 0
+            self._z_nan_element_count = 0
+            self._z_nan_element_total = 0
+
     def lorentz_expmap_aggregation(self, v, score):
         v_tangent = self.manifold.logmap0(v)
         weighted_v_tangent = torch.matmul(score, v_tangent)
@@ -150,25 +156,60 @@ class LorentzMultiHeadAttention(nn.Module):
             inner_OK = -sqrt_k * k_time.transpose(-1, -2)  # [b,h,1,n]
 
             # --- Angular signal Z (inner-product formulation, no HLoC) ---
-            norm_sq_QK = (inner_QK.pow(2) / K - K).clamp_min(0.0)
-            norm_sq_OQ = (inner_OQ.pow(2) / K - K).clamp_min(0.0)
-            numer_Z    = inner_OK + (inner_QK * inner_OQ) / K
-            denom_Z    = torch.sqrt(norm_sq_QK * norm_sq_OQ + (5e-3)**2)
-            Z_safe     = (numer_Z / denom_Z).clamp(-1.0, 1.0)
+            # CHANGE-1: Additive ε on each norm separately, eliminating the bias
+            # toward sign(numer_Z) when ‖q_space‖ → 0. Original ε=5e-3 inside
+            # sqrt forced Z toward sign(numer_Z) for tokens near origin (Phase 0).
+            EPS_Z_INNER = 1e-12
+            norm_sq_QK  = (inner_QK.pow(2) / K - K).clamp_min(0.0)
+            norm_sq_OQ  = (inner_OQ.pow(2) / K - K).clamp_min(0.0)
+            numer_Z     = inner_OK + (inner_QK * inner_OQ) / K
+            norm_QK     = torch.sqrt(norm_sq_QK + EPS_Z_INNER)
+            norm_OQ     = torch.sqrt(norm_sq_OQ + EPS_Z_INNER)
+            denom_Z     = norm_QK * norm_OQ
+            Z_raw       = numer_Z / denom_Z
 
-            if self.training and torch.isnan(Z_safe).any():
-                import warnings
-                warnings.warn(
-                    f"[HAA layer {self.layer_idx}] NaN in Z_safe — "
-                    f"inner_QK max: {inner_QK.abs().max().item():.2e}")
-                Z_safe = torch.zeros_like(Z_safe)
+            # STEP 0 Action A / Item 8: element-wise NaN telemetry — never
+            # full-matrix zeroing (full zeroing collapses entailment to depth-only,
+            # destroying K-structure for the entire attention row).
+            nan_mask = torch.isnan(Z_raw)
+            if nan_mask.any():
+                self._z_nan_batch_count   += 1
+                self._z_nan_element_count += nan_mask.sum().item()
+            self._z_nan_element_total += Z_raw.numel()
+            self._z_nan_total_calls   += 1
+
+            if not self.training and nan_mask.any():
+                raise RuntimeError(
+                    f"[HAA L{self.layer_idx}] NaN in Z during eval — "
+                    f"{nan_mask.sum().item()}/{Z_raw.numel()} elements. "
+                    "Eval metrics would be fabricated. Diagnose inner_QK.")
+
+            # CHANGE-1: Validity mask (degenerate spatial component → Z=0,
+            # geometrically neutral) combined with NaN rescue into one torch.where.
+            mask_valid = (norm_sq_OQ > 1e-6).expand_as(Z_raw)
+            Z_safe = torch.where(
+                mask_valid & ~nan_mask,
+                Z_raw.clamp(-1.0, 1.0),
+                torch.zeros_like(Z_raw))
+
+            if self._z_nan_batch_count % 100 == 1 and nan_mask.any():
+                print(f"[HAA L{self.layer_idx}] Z NaN rescue: "
+                      f"cumulative element rate: "
+                      f"{100*self._z_nan_element_count/max(1,self._z_nan_element_total):.4f}%",
+                      flush=True)
 
             # --- Radial depth and aperture B ---
             c_tilde = torch.acosh((q_time / sqrt_k).clamp_min(1.0 + 1e-3))
             beta    = F.softplus(self.beta_raw)
             sinh_c  = torch.sinh(c_tilde)
-            arg_B   = 1.0 - (beta / sinh_c).pow(2)
-            B       = torch.sqrt(F.relu(arg_B) + 1e-8)
+            arg_B = 1.0 - (beta / sinh_c).pow(2)
+            # CHANGE-2: Softplus floor restores β-gradient in the shallow regime.
+            # F.relu kills ∂B/∂β when arg_B < 0 (all shallow tokens → β frozen).
+            # Softplus provides exponentially small but non-zero gradient everywhere,
+            # allowing β to receive aggregate signal even when no individual token
+            # is in the active (arg_B > 0) regime.
+            # scale=4.0 → softplus(4·x)/4 ≈ relu(x) for |x|>1, smooth for |x|<1.
+            B = torch.sqrt(F.softplus(arg_B * 4.0) / 4.0 + 1e-8)
 
             # Gradient hooks for diagnostic layers only (first and last HAA layer)
             if self.training and self.layer_idx in (0, self.max_layer_idx):
@@ -217,6 +258,14 @@ class LorentzMultiHeadAttention(nn.Module):
         attn_space = attn.narrow(-1, 1, attn.shape[-1]-1).reshape(b, n, -1)
         attn_time = attn.narrow(-1, 0, 1).reshape(b, n, -1)
         time_sq_arg = torch.sum(attn_time ** 2, dim=-1, keepdim=True) - ((self.heads - 1) * self.manifold.k)
+        # CHANGE-6: Detect FP32 drift in time-coordinate accumulation (eval only).
+        # If this fires, downstream HAA measurements on these tokens are corrupted.
+        if (not self.training) and time_sq_arg.min() <= 0:
+            import warnings
+            warnings.warn(
+                f"[L{self.layer_idx}] FP32 drift detected: time_sq_arg.min()="
+                f"{time_sq_arg.min().item():.2e}. Manifold constraint violated. "
+                f"HAA geometric measurements unreliable on this batch.")
         attn_time_rescaled = torch.sqrt(time_sq_arg.clamp_min(1e-8))
         attn = torch.concat((attn_time_rescaled, attn_space), dim=-1)
 

@@ -125,6 +125,8 @@ def getArguments():
     parser.add_argument('--deep_diagnostics', action='store_true',
         help="Run extra val pass at epochs {1,5,10,20,final} for geometric diagnostics. "
              "Disable for RNG-clean training runs.")
+    parser.add_argument('--eval_only', action='store_true',
+        help="Skip training; load checkpoint and run a single validation pass + HAA telemetry.")
 
     args = parser.parse_args()
 
@@ -218,6 +220,25 @@ def main(args):
     train_losses, val_losses = [], []
     train_acc1s, val_acc1s = [], []
     train_acc5s, val_acc5s = [], []
+
+    # ------------------------------------------------------------------
+    # Eval-only shortcut: load checkpoint, run one val pass, log HAA
+    # telemetry, and exit — no training loop entered at all.
+    # Used for STEP 1 checkpoint verification (z_mean measurement after
+    # CHANGE-1 numerics fix).
+    # ------------------------------------------------------------------
+    if args.eval_only:
+        with torch.no_grad():
+            loss_val, acc1_val, acc5_val = evaluate(model, val_loader, criterion, device)
+        print(f"[eval_only] Val: Loss={loss_val:.4f}, "
+              f"Acc@1={acc1_val:.4f}, Acc@5={acc5_val:.4f}")
+        log_haa_epoch_metrics(model, epoch=start_epoch, writer=writer)
+        if args.deep_diagnostics:
+            _base_m = model.module if hasattr(model, 'module') else model
+            _K = _base_m.enc_manifold.k.item()
+            log_haa_deep_diagnostics(model, val_loader, device, start_epoch, _K, writer)
+        writer.close()
+        return
 
     print("Training...")
     global_step = start_epoch * len(train_loader)
