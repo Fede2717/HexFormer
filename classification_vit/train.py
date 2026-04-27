@@ -25,6 +25,7 @@ from lib.utils.utils import AverageMeter, accuracy
 from lib.utils.mix import cutmix_data, mixup_data, mixup_criterion
 from lib.utils.losses import LabelSmoothingCrossEntropy
 from haa_diagnostics import log_haa_epoch_metrics, log_haa_deep_diagnostics
+from haa_auxiliary_loss import build_aux_losses
 
 os.environ['WANDB_DIR'] = '/media/hdd/usr/forner/wandb/'
 
@@ -127,6 +128,29 @@ def getArguments():
              "Disable for RNG-clean training runs.")
     parser.add_argument('--eval_only', action='store_true',
         help="Skip training; load checkpoint and run a single validation pass + HAA telemetry.")
+
+    # STEP 2 / CHANGE-2: aperture-gradient regime
+    parser.add_argument('--B_smooth', choices=['relu', 'softplus'], default='softplus',
+        help="Smoothing for aperture B argument: 'softplus' restores β-gradient in "
+             "the shallow regime (recommended); 'relu' is the legacy clamp.")
+    parser.add_argument('--B_softplus_temp', type=float, default=4.0,
+        help="Temperature for softplus B smoothing. softplus(temp·x)/temp ≈ relu(x) "
+             "for |x|>1, smooth for |x|<1.")
+
+    # STEP 4 / CHANGE-3: β init override
+    parser.add_argument('--beta_init_override', type=float, default=None,
+        help="Override β init for ALL HAA layers (replaces mode default and "
+             "beta_proportional). None = use mode default.")
+
+    # STEP 3 / CHANGE-4 + CHANGE-5: auxiliary loss weights
+    parser.add_argument('--gamma_max', type=float, default=0.0,
+        help="Max plateau weight for ConeOccupancyLoss (0 disables).")
+    parser.add_argument('--eta_max', type=float, default=0.0,
+        help="Max plateau weight for HyperbolicHierarchyLoss (0 disables).")
+    parser.add_argument('--gamma_warmup', type=int, default=15,
+        help="Epoch at which the cone-occupancy ramp begins.")
+    parser.add_argument('--eta_warmup', type=int, default=5,
+        help="Epoch at which the HHL ramp begins.")
 
     args = parser.parse_args()
 
@@ -243,6 +267,18 @@ def main(args):
     print("Training...")
     global_step = start_epoch * len(train_loader)
 
+    # STEP 3 / CHANGE-4: build auxiliary loss modules (Loss Factory pattern).
+    # Both losses are no-ops when their weight is 0 (default), so this call is
+    # safe for baseline/legacy runs.
+    aux_losses = build_aux_losses(args)
+    for _name, _loss_fn in aux_losses.items():
+        if _loss_fn is not None:
+            _loss_fn.to(device)
+            print(f"[AUX LOSS] Enabled '{_name}' "
+                  f"(plateau={_loss_fn.schedule.plateau}, "
+                  f"warmup={_loss_fn.schedule.warmup}, "
+                  f"ramp={_loss_fn.schedule.ramp})", flush=True)
+
     best_acc = 0.0
     best_epoch = 0
 
@@ -278,6 +314,7 @@ def main(args):
             # ------- Start iteration -------
             x = x.to(device)
             y = y.to(device)
+            y_original = y.clone()  # preserve for HHL aux loss
 
             # Cutmix and Mixup
             r = np.random.rand(1)
@@ -300,10 +337,19 @@ def main(args):
                     loss = mixup_criterion(criterion, output, y_a, y_b, lam) 
             else:
                 output = model(x)
-                loss = criterion(output, y) 
+                loss = criterion(output, y)
+
+            # STEP 3 / CHANGE-4: aux-loss accumulation block. Single insertion
+            # point — no aux logic anywhere else in train.py.
+            loss_total = loss
+            for _aux_name, _aux_fn in aux_losses.items():
+                if _aux_fn is not None:
+                    _w = _aux_fn.schedule(epoch)
+                    if _w > 0:
+                        loss_total = loss_total + _w * _aux_fn(model, x, y_original, device)
 
             optimizer.zero_grad()
-            loss.backward()
+            loss_total.backward()
             
             if args.histogram:
                 if (i > 0 and i % 300 == 0) or i in [1, 5, 10, 25, 50, 75, 100, 150, 200]:

@@ -40,7 +40,8 @@ class LorentzEmbedding(nn.Module):
 class LorentzTransformerEncoder(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout,
                  stochastic_depth=0.1, use_haa=False, beta_init_val=None,
-                 tau_init=0.1, lambda_init=1.0):
+                 tau_init=0.1, lambda_init=1.0,
+                 B_smooth='softplus', B_softplus_temp=4.0):
         super(LorentzTransformerEncoder, self).__init__()
 
         self.manifold = manifold
@@ -52,7 +53,8 @@ class LorentzTransformerEncoder(nn.Module):
         self.dropout = dropout
 
         self.ln1 = LorentzLayerNorm(manifold, hidden)
-        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init)
+        self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init,
+                                             B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
         self.ln2 = LorentzLayerNorm(manifold, hidden)
         self.mlp = nn.Sequential(
             LorentzFullyConnected(manifold, hidden, mlp_hidden, activation=nn.GELU(), dropout=dropout),
@@ -72,8 +74,12 @@ class LorentzTransformerEncoder(nn.Module):
 class LorentzMultiHeadAttention(nn.Module):
     def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0,
                  learn_scale=False, use_haa=False, beta_init_val=None,
-                 tau_init=0.1, lambda_init=1.0):
+                 tau_init=0.1, lambda_init=1.0,
+                 B_smooth='softplus', B_softplus_temp=4.0):
         super(LorentzMultiHeadAttention, self).__init__()
+        # CHANGE-2: aperture-gradient regime selector (relu = legacy, softplus = fixed)
+        self.B_smooth = B_smooth
+        self.B_softplus_temp = B_softplus_temp
 
         self.manifold = manifold
 
@@ -125,6 +131,12 @@ class LorentzMultiHeadAttention(nn.Module):
             self._z_nan_element_count = 0
             self._z_nan_element_total = 0
 
+            # STEP 3 / CHANGE-4: live tensors exposed for auxiliary losses
+            # (ConeOccupancyLoss reads B, Z; HHL reads CLS time coord).
+            self._last_B = None
+            self._last_Z = None
+            self._last_cls_time = None
+
     def lorentz_expmap_aggregation(self, v, score):
         v_tangent = self.manifold.logmap0(v)
         weighted_v_tangent = torch.matmul(score, v_tangent)
@@ -145,6 +157,10 @@ class LorentzMultiHeadAttention(nn.Module):
             k_time  = k.narrow(-1, 0, 1)
             q_space = q.narrow(-1, 1, q.shape[-1] - 1)
             k_space = k.narrow(-1, 1, k.shape[-1] - 1)
+
+            # STEP 3 / CHANGE-4: capture CLS token time coord (with gradient)
+            # for HHL. q_time shape: [b, h, n, 1]; CLS is token index 0.
+            self._last_cls_time = q_time[:, :, 0:1, :]
 
             sqrt_k = torch.sqrt(self.manifold.k)
             K = self.manifold.k
@@ -209,7 +225,15 @@ class LorentzMultiHeadAttention(nn.Module):
             # allowing β to receive aggregate signal even when no individual token
             # is in the active (arg_B > 0) regime.
             # scale=4.0 → softplus(4·x)/4 ≈ relu(x) for |x|>1, smooth for |x|<1.
-            B = torch.sqrt(F.softplus(arg_B * 4.0) / 4.0 + 1e-8)
+            if self.B_smooth == 'softplus':
+                arg_B_smooth = F.softplus(self.B_softplus_temp * arg_B) / self.B_softplus_temp
+                B = torch.sqrt(arg_B_smooth + 1e-8)
+            else:  # legacy relu (backward compatibility)
+                B = torch.sqrt(F.relu(arg_B) + 1e-8)
+
+            # STEP 3 / CHANGE-4: expose B and Z for ConeOccupancyLoss.
+            self._last_B = B
+            self._last_Z = Z_safe
 
             # Gradient hooks for diagnostic layers only (first and last HAA layer)
             if self.training and self.layer_idx in (0, self.max_layer_idx):

@@ -63,6 +63,11 @@ def select_model(img_dim, num_classes, args):
     }
     enc_args['tau_init']    = getattr(args, 'haa_tau_init',    0.1)
     enc_args['lambda_init'] = getattr(args, 'haa_lambda_init', 1.0)
+    # STEP 2 / CHANGE-2: aperture-gradient regime (relu = legacy, softplus = fixed)
+    enc_args['B_smooth']        = getattr(args, 'B_smooth',        'softplus')
+    enc_args['B_softplus_temp'] = getattr(args, 'B_softplus_temp', 4.0)
+    # STEP 4 / CHANGE-3: optional override of β init for all HAA layers
+    enc_args['beta_init_override'] = getattr(args, 'beta_init_override', None)
 
     if (args.encoder_manifold=="lorentz") or (args.encoder_manifold=="poincare"):
         enc_args['learn_k'] = args.learn_k
