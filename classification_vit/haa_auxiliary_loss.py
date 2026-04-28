@@ -68,7 +68,7 @@ class RampSchedule:
 class ConeOccupancyLoss(nn.Module):
     """Smooth surrogate for cone occupancy with band-hinge target.
 
-    s_cone = mean( σ( κ · ( -(B + Z) - m_smooth ) ) )
+    s_cone = mean( σ( κ · ( -Z - m_smooth ) ) )
 
     Penalises when s_cone falls outside the band [s_lo, s_hi].
     """
@@ -91,9 +91,10 @@ class ConeOccupancyLoss(nn.Module):
         mha = _get_last_haa_mha(model)
         if mha is None or mha._last_B is None or mha._last_Z is None:
             return torch.zeros((), device=device)
-        B = mha._last_B
         Z = mha._last_Z
-        cone_score = -(B + Z) - self.m_smooth
+        # REPLACED -(B+Z) WITH -Z: Breaks the cheap beta-collapse gradient path.
+        # Occupancy must be satisfied by moving Z structurally, not inflating beta.
+        cone_score = -Z - self.m_smooth
         s_cone = torch.sigmoid(self.kappa * cone_score).mean()
         loss_lo = F.relu(self.s_lo - s_cone).pow(2)
         loss_hi = F.relu(s_cone - self.s_hi).pow(2)
@@ -185,18 +186,31 @@ class HyperbolicHierarchyLoss(nn.Module):
                     + (1.0 - self.ema) * fine_mean[mask_fine].detach()
                 )
 
-        # Aggregate fine-class token depths per superclass
+        # NOTE: This fix produces non-zero gradient but does NOT guarantee
+        # directional depth stratification. Both tensors are derived from the
+        # same batch with no external reference; the gradient is non-zero but
+        # stochastic in sign across batches. Directional radial supervision
+        # requires the prototype loss (L_proto) introduced in the next iteration.
+        # This fix is diagnostic — it confirms whether HHL contributes anything.
+        #
+        # Map per-fine-class mean depths (computed above) to their superclasses,
+        # then average. This is class-weighted, mathematically distinct from
+        # super_mean (which is token-weighted across the whole superclass).
+        observed_fine_idx = mask_fine.nonzero(as_tuple=False).squeeze(-1)
+        super_of_observed_fine = self.fine_to_super_lut[observed_fine_idx]
         fine_mean_per_super  = torch.zeros(NUM_SUPER, device=depths.device)
-        fine_count_per_super = torch.zeros(NUM_SUPER, device=depths.device)
-        fine_mean_per_super.scatter_add_(0, super_labels, depths)
-        fine_count_per_super.scatter_add_(0, super_labels,
-                                          torch.ones_like(depths))
+        fine_classes_per_super = torch.zeros(NUM_SUPER, device=depths.device)
+        fine_mean_per_super.scatter_add_(0, super_of_observed_fine,
+                                         fine_mean[observed_fine_idx])
+        fine_classes_per_super.scatter_add_(
+            0, super_of_observed_fine,
+            torch.ones_like(fine_mean[observed_fine_idx]))
         fine_mean_per_super = (fine_mean_per_super
-                               / fine_count_per_super.clamp_min(1.0))
+                               / fine_classes_per_super.clamp_min(1.0))
 
         # Hinge: super centroid must be shallower than fine centroid
         # by at least margin. Active only for superclasses present in batch.
-        mask = (super_count > 0) & (fine_count_per_super > 0)
+        mask = (super_count > 0) & (fine_classes_per_super > 0)
         if not mask.any():
             return torch.zeros((), device=device)
 

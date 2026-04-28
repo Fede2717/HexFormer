@@ -107,9 +107,13 @@ def compute_Z(q: torch.Tensor, k: torch.Tensor, K: float) -> torch.Tensor:
     norm_sq_QK = (inner_QK.pow(2) / K - K).clamp_min(0.0)
     norm_sq_OQ = (inner_OQ.pow(2) / K - K).clamp_min(0.0)
     numer_Z    = inner_OK + (inner_QK * inner_OQ) / K
-    EPS_Z      = 5e-3
-    denom_Z = torch.sqrt(norm_sq_QK * norm_sq_OQ + (5e-3)**2)
-    return (numer_Z / denom_Z).clamp(-1.0, 1.0)
+    denom = torch.sqrt(norm_sq_QK + 1e-12) * torch.sqrt(norm_sq_OQ + 1e-12)
+    Z_raw = numer_Z / denom
+    mask_valid = (norm_sq_OQ > 1e-6).expand_as(Z_raw)
+    nan_mask = torch.isnan(Z_raw)
+    return torch.where(mask_valid & ~nan_mask,
+                       Z_raw.clamp(-1.0, 1.0),
+                       torch.zeros_like(Z_raw))
 
 
 def compute_B(q_time: torch.Tensor, K: float, beta: float) -> torch.Tensor:
