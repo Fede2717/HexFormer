@@ -40,7 +40,7 @@ class LorentzEmbedding(nn.Module):
 class LorentzTransformerEncoder(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout,
                  stochastic_depth=0.1, use_haa=False, beta_init_val=None,
-                 tau_init=0.1, lambda_init=1.0,
+                 tau_init=1.0, lambda_init=1.0,
                  B_smooth='softplus', B_softplus_temp=4.0):
         super(LorentzTransformerEncoder, self).__init__()
 
@@ -74,7 +74,7 @@ class LorentzTransformerEncoder(nn.Module):
 class LorentzMultiHeadAttention(nn.Module):
     def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0,
                  learn_scale=False, use_haa=False, beta_init_val=None,
-                 tau_init=0.1, lambda_init=1.0,
+                 tau_init=1.0, lambda_init=1.0,
                  B_smooth='softplus', B_softplus_temp=4.0):
         super(LorentzMultiHeadAttention, self).__init__()
         # CHANGE-2: aperture-gradient regime selector (relu = legacy, softplus = fixed)
@@ -104,8 +104,13 @@ class LorentzMultiHeadAttention(nn.Module):
         self._grad_norms = {}
 
         if use_haa:
-            # τ₀=0.1: Phase 0 showed z_mean≈+0.80 everywhere; low τ lets spatial
-            # penalty (which varies across pairs) dominate early training.
+            # τ_init=1.0 calibrated to spatial penalty dynamic range.
+            # Spatial range ≈ [-λ·1.98, 0]; entailment range ≈ [-τ·1.40, +τ·0.36].
+            # With λ_init=1.0, setting τ_init=1.0 gives magnitude ratio ≈ 1:1,
+            # ensuring the entailment term contributes meaningful score-matrix
+            # variance from epoch 0. Lower τ_init values produce sub-softmax-noise
+            # entailment signal and prevent β/τ from receiving informative gradient
+            # — a structural cause of the deadlock.
             if beta_init_val is not None and beta_init_val > 1e-6:
                 _beta_raw_init = math.log(math.exp(beta_init_val) - 1.0)
             elif beta_init_val is not None:
@@ -130,12 +135,21 @@ class LorentzMultiHeadAttention(nn.Module):
             self._z_nan_total_calls   = 0
             self._z_nan_element_count = 0
             self._z_nan_element_total = 0
+            # A5: sentry for the close-pair regime (norm_sq_QK ≤ 1e-6).
+            self._z_nearzero_qk_count = 0
 
             # STEP 3 / CHANGE-4: live tensors exposed for auxiliary losses
-            # (ConeOccupancyLoss reads B, Z; HHL reads CLS time coord).
+            # (DirectionalAngularLoss reads Z; HHL reads CLS time coord;
+            # B is retained for diagnostics/future use).
             self._last_B = None
             self._last_Z = None
             self._last_cls_time = None
+            self._last_valid_mask = None
+            self._last_cls_lorentz = None
+            self._last_all_tokens_lorentz = None
+            # P4: origin-only counter (norm_sq_OQ ≤ 1e-6) — distinct failure
+            # mode from generic Q-K close-pair masking.
+            self._z_origin_count = 0
 
     def lorentz_expmap_aggregation(self, v, score):
         v_tangent = self.manifold.logmap0(v)
@@ -147,6 +161,11 @@ class LorentzMultiHeadAttention(nn.Module):
 
     def forward(self, x):
         b, n, l = x.size()
+
+        if self.use_haa:
+            # P5: full pre-attention token tensor — gradient-preserving
+            # reference used by L_betacap to derive the geometric envelope.
+            self._last_all_tokens_lorentz = x
 
         q = self.q(x)
         k = self.k(x)
@@ -161,6 +180,9 @@ class LorentzMultiHeadAttention(nn.Module):
             # STEP 3 / CHANGE-4: capture CLS token time coord (with gradient)
             # for HHL. q_time shape: [b, h, n, 1]; CLS is token index 0.
             self._last_cls_time = q_time[:, :, 0:1, :]
+            # P5: full CLS Lorentz embedding from head 0 — used by
+            # L_proto and L_radvar. Head 0 is chosen for determinism.
+            self._last_cls_lorentz = x[:, 0, :]   # [b, num_features] = [b, hidden_dim+1]
 
             sqrt_k = torch.sqrt(self.manifold.k)
             K = self.manifold.k
@@ -200,13 +222,24 @@ class LorentzMultiHeadAttention(nn.Module):
                     f"{nan_mask.sum().item()}/{Z_raw.numel()} elements. "
                     "Eval metrics would be fabricated. Diagnose inner_QK.")
 
-            # CHANGE-1: Validity mask (degenerate spatial component → Z=0,
+            # CHANGE-1 + A5: Validity mask (degenerate spatial component → Z=0,
             # geometrically neutral) combined with NaN rescue into one torch.where.
-            mask_valid = (norm_sq_OQ > 1e-6).expand_as(Z_raw)
+            # A5: mask is symmetric in Q and K — close-pair regime drives
+            # norm_sq_QK toward 0, blowing up the denominator before the NaN
+            # check fires. Catching it here keeps Z_safe finite.
+            mask_valid = ((norm_sq_QK > 1e-6) & (norm_sq_OQ > 1e-6)).expand_as(Z_raw)
+            nearzero_qk = (norm_sq_QK <= 1e-6)
+            if nearzero_qk.any():
+                self._z_nearzero_qk_count += nearzero_qk.sum().item()
+            # P4: origin-only failure (norm_sq_OQ near 0) tracked separately.
+            self._z_origin_count += (norm_sq_OQ <= 1e-6).sum().item()
             Z_safe = torch.where(
                 mask_valid & ~nan_mask,
                 Z_raw.clamp(-1.0, 1.0),
                 torch.zeros_like(Z_raw))
+            # P1: expose joint validity mask so DirectionalAngularLoss can
+            # restrict its mean to geometrically valid pairs only.
+            self._last_valid_mask = (mask_valid & ~nan_mask).detach()
 
             if self._z_nan_batch_count % 100 == 1 and nan_mask.any():
                 print(f"[HAA L{self.layer_idx}] Z NaN rescue: "
@@ -231,7 +264,8 @@ class LorentzMultiHeadAttention(nn.Module):
             else:  # legacy relu (backward compatibility)
                 B = torch.sqrt(F.relu(arg_B) + 1e-8)
 
-            # STEP 3 / CHANGE-4: expose B and Z for ConeOccupancyLoss.
+            # STEP 3 / CHANGE-4: expose B and Z for DirectionalAngularLoss
+            # (uses Z only; B kept for diagnostics).
             self._last_B = B
             self._last_Z = Z_safe
 

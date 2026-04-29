@@ -38,7 +38,7 @@ class ViT(nn.Module):
         remove_linear=False,
         active_haa_layers=None,
         beta_proportional=False,
-        tau_init=0.1,
+        tau_init=1.0,
         lambda_init=1.0,
         beta_init_override=None,
         B_smooth='softplus',
@@ -136,7 +136,7 @@ class ViT(nn.Module):
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
 
-    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False, beta_init_val=None, tau_init=0.1, lambda_init=1.0,
+    def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False, beta_init_val=None, tau_init=1.0, lambda_init=1.0,
                                 B_smooth='softplus', B_softplus_temp=4.0):
         if self.manifold is None:
             return TransformerEncoder(hidden_dim, mlp_dim, num_patches, heads, dropout)

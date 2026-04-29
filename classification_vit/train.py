@@ -20,7 +20,10 @@ import csv  # Import CSV module for saving the metrics
 from torch.utils.tensorboard import SummaryWriter  # Import TensorBoard
 import datetime
 
-from utils.initialize import select_dataset, select_model, select_optimizer, load_checkpoint
+from utils.initialize import (
+    select_dataset, select_model, select_optimizer, load_checkpoint,
+    attach_hyperbolic_prototypes,
+)
 from lib.utils.utils import AverageMeter, accuracy
 from lib.utils.mix import cutmix_data, mixup_data, mixup_criterion
 from lib.utils.losses import LabelSmoothingCrossEntropy
@@ -119,8 +122,10 @@ def getArguments():
     parser.add_argument('--haa_mode', default='baseline', type=str,
                         choices=['baseline', 'terminal', 'full_uniform', 'continuous', 'terminal_aggressive'],
                         help="HAA injection mode: baseline=no HAA, terminal=last layer only, full_uniform=all layers, continuous=all layers with depth-proportional beta init, terminal_aggressive=last layer with high tau/low lambda.")
-    parser.add_argument('--haa_tau_init', default=0.1, type=float,
-        help="Initial tau value for HAA entailment weight. Default 0.1. Use 3.0 for terminal_aggressive.")
+    parser.add_argument('--haa_tau_init', default=1.0, type=float,
+        help="Initial tau value for HAA entailment weight. Default 1.0 "
+             "(P3: calibrated to spatial penalty dynamic range). "
+             "Use 3.0 for terminal_aggressive.")
     parser.add_argument('--haa_lambda_init', default=1.0, type=float,
         help="Initial lambda value for HAA spatial weight. Default 1.0. Use 0.3 for terminal_aggressive.")
     parser.add_argument('--deep_diagnostics', action='store_true',
@@ -143,16 +148,50 @@ def getArguments():
              "beta_proportional). None = use mode default.")
 
     # STEP 3 / CHANGE-4 + CHANGE-5: auxiliary loss weights
-    parser.add_argument('--gamma_max', type=float, default=0.0,
-        help="Max plateau weight for ConeOccupancyLoss (0 disables).")
+    parser.add_argument('--gamma_angular_max', type=float, default=0.0,
+        help="Max plateau weight for DirectionalAngularLoss (0 disables).")
     parser.add_argument('--eta_max', type=float, default=0.0,
         help="Max plateau weight for HyperbolicHierarchyLoss (0 disables).")
-    parser.add_argument('--gamma_warmup', type=int, default=15,
-        help="Epoch at which the cone-occupancy ramp begins.")
+    parser.add_argument('--gamma_angular_warmup', type=int, default=15,
+        help="Epoch at which the angular-ordering ramp begins.")
     parser.add_argument('--eta_warmup', type=int, default=5,
         help="Epoch at which the HHL ramp begins.")
+    # A3 deprecation shim — accept the old flag names for one release.
+    parser.add_argument('--gamma_max', type=float, default=None,
+        help="DEPRECATED: use --gamma_angular_max. Retained for one release.")
+    parser.add_argument('--gamma_warmup', type=int, default=None,
+        help="DEPRECATED: use --gamma_angular_warmup. Retained for one release.")
+
+    # P5: L_proto / L_radvar / L_betacap weights and configuration.
+    parser.add_argument('--eta_proto_max', type=float, default=0.0)
+    parser.add_argument('--eta_proto_warmup', type=int, default=5)
+    parser.add_argument('--zeta_radvar_max', type=float, default=0.0)
+    parser.add_argument('--zeta_radvar_warmup', type=int, default=5)
+    parser.add_argument('--sigma2_target', type=float, default=0.10)
+    parser.add_argument('--xi_betacap_max', type=float, default=0.0)
+    parser.add_argument('--xi_betacap_warmup', type=int, default=20)
+    parser.add_argument('--betacap_percentile', type=float, default=0.25)
+    parser.add_argument('--betacap_static_target', type=float, default=None)
+    parser.add_argument('--baseline_cls_emb_path', type=str, default=None)
+    parser.add_argument('--proto_seed', type=int, default=42)
+    parser.add_argument('--d_s', type=float, default=0.3)
+    parser.add_argument('--d_f_low', type=float, default=0.5)
+    parser.add_argument('--d_f_high', type=float, default=1.85)
 
     args = parser.parse_args()
+
+    if args.gamma_max is not None:
+        import warnings as _warnings
+        _warnings.warn(
+            "--gamma_max is deprecated; use --gamma_angular_max instead.",
+            DeprecationWarning, stacklevel=2)
+        args.gamma_angular_max = args.gamma_max
+    if args.gamma_warmup is not None:
+        import warnings as _warnings
+        _warnings.warn(
+            "--gamma_warmup is deprecated; use --gamma_angular_warmup instead.",
+            DeprecationWarning, stacklevel=2)
+        args.gamma_angular_warmup = args.gamma_warmup
 
     return args
 
@@ -181,7 +220,7 @@ def main(args):
     args.beta_proportional = (args.haa_mode == 'continuous')
 
     if args.haa_mode == 'terminal_aggressive':
-        if args.haa_tau_init == 0.1:
+        if args.haa_tau_init == 1.0:
             args.haa_tau_init = 3.0
         if args.haa_lambda_init == 1.0:
             args.haa_lambda_init = 0.3
@@ -233,6 +272,13 @@ def main(args):
     else:
         _run_exp_name = args.exp_name
 
+    # PN: append active-aux-loss tokens (proto, radvar, betacap, angular, hhl)
+    # so concurrent ablations never collide on a single checkpoint / CSV /
+    # TensorBoard logdir. Resolution runs exactly once, before any path is built.
+    from run_naming import resolve_run_name
+    _run_exp_name = resolve_run_name(_run_exp_name, args)
+    args.run_name = _run_exp_name
+
     # Initialize TensorBoard writer
     # Set up TensorBoard logging directory with a unique name for each experiment
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -270,6 +316,9 @@ def main(args):
     # STEP 3 / CHANGE-4: build auxiliary loss modules (Loss Factory pattern).
     # Both losses are no-ops when their weight is 0 (default), so this call is
     # safe for baseline/legacy runs.
+    # P5: build fixed Lorentz prototypes when L_proto is active. Must run
+    # before build_aux_losses so the factory can pick up args.hyperbolic_prototypes.
+    attach_hyperbolic_prototypes(model, args)
     aux_losses = build_aux_losses(args)
     for _name, _loss_fn in aux_losses.items():
         if _loss_fn is not None:

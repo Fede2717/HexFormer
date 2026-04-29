@@ -1,3 +1,6 @@
+import os
+import warnings
+
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -14,6 +17,46 @@ from lib.utils.scheduler import build_scheduler
 from lib.utils.autoaug import CIFAR10Policy
 from lib.utils.random_erasing import RandomErasing
 from lib.utils.sampler import RASampler
+
+
+def attach_hyperbolic_prototypes(model, args):
+    """P5: build the fixed-prototype tensor for L_proto and stash it on
+    ``args.hyperbolic_prototypes`` so ``build_aux_losses`` can pick it up.
+
+    No-op when ``args.eta_proto_max`` is not strictly positive.
+    """
+    if float(getattr(args, 'eta_proto_max', 0.0)) <= 0:
+        return
+    from haa_auxiliary_loss import build_hyperbolic_prototypes
+    from cifar100_hierarchy import FINE_TO_SUPER, NUM_FINE, NUM_SUPER
+
+    lut = torch.zeros(NUM_FINE, dtype=torch.long)
+    for f, s in FINE_TO_SUPER.items():
+        lut[f] = s
+
+    baseline_emb = None
+    baseline_path = getattr(args, 'baseline_cls_emb_path', None)
+    if baseline_path is not None and os.path.exists(baseline_path):
+        baseline_emb = torch.load(baseline_path, map_location='cpu')
+    elif baseline_path is not None:
+        warnings.warn(
+            f"L_proto enabled and baseline_cls_emb_path={baseline_path!r} "
+            "missing; falling back to random orthonormal super-prototype angles.")
+
+    protos = build_hyperbolic_prototypes(
+        num_super=NUM_SUPER,
+        num_fine=NUM_FINE,
+        hidden_dim=args.hidden_dim + 1,
+        fine_to_super_lut=lut,
+        K=float(getattr(args, 'encoder_k', 1.0)),
+        baseline_cls_embeddings=baseline_emb,
+        seed=int(getattr(args, 'proto_seed', 42)),
+        d_s=float(getattr(args, 'd_s', 0.3)),
+        d_f_low=float(getattr(args, 'd_f_low', 0.5)),
+        d_f_high=float(getattr(args, 'd_f_high', 1.85)),
+    )
+    protos = protos.to(next(model.parameters()).device)
+    args.hyperbolic_prototypes = protos
 
 
 def load_checkpoint(model, optimizer, lr_scheduler, args):
@@ -61,7 +104,7 @@ def select_model(img_dim, num_classes, args):
         'active_haa_layers'  : getattr(args, 'active_haa_layers', []),
         'beta_proportional'  : getattr(args, 'beta_proportional', False),
     }
-    enc_args['tau_init']    = getattr(args, 'haa_tau_init',    0.1)
+    enc_args['tau_init']    = getattr(args, 'haa_tau_init',    1.0)
     enc_args['lambda_init'] = getattr(args, 'haa_lambda_init', 1.0)
     # STEP 2 / CHANGE-2: aperture-gradient regime (relu = legacy, softplus = fixed)
     enc_args['B_smooth']        = getattr(args, 'B_smooth',        'softplus')

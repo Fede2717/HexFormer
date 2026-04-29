@@ -5,12 +5,17 @@ All auxiliary loss logic is contained in this module; the training loop
 only calls ``build_aux_losses(args)`` once and iterates the returned dict.
 
 Modules:
-    RampSchedule          — warmup/ramp/plateau weight scheduler
-    ConeOccupancyLoss     — band-hinge surrogate for cone occupancy
-    HyperbolicHierarchyLoss — depth-stratification metric loss (HHL)
-    build_aux_losses      — factory mapping CLI flags to loss instances
+    RampSchedule              — warmup/ramp/plateau weight scheduler
+    DirectionalAngularLoss    — band-hinge surrogate for angular ordering
+    HyperbolicHierarchyLoss   — depth-stratification metric loss (HHL)
+    HyperbolicPrototypeLoss   — Lorentz-distance to fixed fine prototypes
+    RadialVarianceLoss        — one-sided hinge on radial-depth variance
+    BetaCapLoss               — cap β to the geometric envelope of the batch
+    build_hyperbolic_prototypes — fixed-prototype constructor for L_proto
+    build_aux_losses          — factory mapping CLI flags to loss instances
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +23,92 @@ import torch.nn.functional as F
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from cifar100_hierarchy import FINE_TO_SUPER, NUM_FINE, NUM_SUPER
+
+
+# ---------------------------------------------------------------------------
+# Prototype constructor (P5 / P6)
+# ---------------------------------------------------------------------------
+def build_hyperbolic_prototypes(num_super: int,
+                                num_fine: int,
+                                hidden_dim: int,
+                                fine_to_super_lut: torch.Tensor,
+                                K: float = 1.0,
+                                baseline_cls_embeddings: torch.Tensor = None,
+                                seed: int = 42,
+                                d_s: float = 0.3,
+                                d_f_low: float = 0.5,
+                                d_f_high: float = 1.85) -> torch.Tensor:
+    """Construct fixed Lorentz prototypes for L_proto.
+
+    Returns a tensor of shape [num_super + num_fine, hidden_dim].
+    Indices [0 : num_super] are super-prototypes, [num_super : num_super+num_fine]
+    are fine-prototypes.
+
+    Depths:
+      - super: d_s (constant, 0.3 by default)
+      - fine:  d_s + d_f[c]  with d_f[c] ~ Uniform(d_f_low, d_f_high)
+        Default d_f range [0.5, 1.85] gives Var(d_f) = 1.35² / 12 ≈ 0.152,
+        which exceeds σ²_target=0.10 with ~50% margin (P6 reconciliation).
+
+    Angular positions:
+      - super angles v_s: top num_super principal components of
+        baseline_cls_embeddings if provided; else random orthonormal via QR.
+      - fine angles w_c: for each c with super(c)=s, sample δ ∈ R^(hidden_dim-1),
+        project onto orthogonal complement of v_s, scale to tan(π/8) magnitude,
+        and renormalise (v_s + δ_perp) to unit norm.
+
+    Final spatial = unit_vec * sinh(depth); time = sqrt(K) * cosh(depth).
+    Concatenated as [time, spatial] to form Lorentz point.
+    """
+    g = torch.Generator().manual_seed(seed)
+    sqrt_K = K ** 0.5
+    spatial_dim = hidden_dim - 1
+
+    # --- super angles ---
+    if baseline_cls_embeddings is not None:
+        spatial_emb = baseline_cls_embeddings[..., 1:]  # drop time coord
+        spatial_emb = spatial_emb - spatial_emb.mean(dim=0, keepdim=True)
+        U, S, Vh = torch.linalg.svd(spatial_emb, full_matrices=False)
+        if Vh.shape[0] < num_super:
+            raise ValueError(
+                f"baseline embeddings have only {Vh.shape[0]} principal components, "
+                f"need {num_super}")
+        super_angles = Vh[:num_super]  # [num_super, spatial_dim]
+    else:
+        rand_mat = torch.randn(spatial_dim, num_super, generator=g)
+        Q, _ = torch.linalg.qr(rand_mat)
+        super_angles = Q.T  # [num_super, spatial_dim]
+    super_angles = super_angles / super_angles.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    # --- fine angles within parent super's cone ---
+    cap_tan = torch.tan(torch.tensor(math.pi / 8.0))
+    fine_angles = torch.zeros(num_fine, spatial_dim)
+    for c in range(num_fine):
+        s = int(fine_to_super_lut[c].item())
+        v_s = super_angles[s]
+        delta = torch.randn(spatial_dim, generator=g)
+        delta_perp = delta - (delta @ v_s) * v_s
+        delta_perp = delta_perp / delta_perp.norm().clamp_min(1e-8)
+        w = v_s + cap_tan.item() * delta_perp
+        w = w / w.norm().clamp_min(1e-8)
+        fine_angles[c] = w
+
+    # --- depths ---
+    super_depths = torch.full((num_super,), d_s)
+    d_f = torch.empty(num_fine).uniform_(d_f_low, d_f_high, generator=g)
+    fine_depths = d_s + d_f
+
+    # --- assemble Lorentz points ---
+    def assemble(angles, depths):
+        sinh_d = torch.sinh(depths).unsqueeze(-1)
+        cosh_d = torch.cosh(depths).unsqueeze(-1)
+        spatial = angles * sinh_d
+        time = sqrt_K * cosh_d
+        return torch.cat([time, spatial], dim=-1)
+
+    super_protos = assemble(super_angles, super_depths)
+    fine_protos = assemble(fine_angles, fine_depths)
+    return torch.cat([super_protos, fine_protos], dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +156,34 @@ class RampSchedule:
 # ---------------------------------------------------------------------------
 # Cone Occupancy Loss
 # ---------------------------------------------------------------------------
-class ConeOccupancyLoss(nn.Module):
-    """Smooth surrogate for cone occupancy with band-hinge target.
+class DirectionalAngularLoss(nn.Module):
+    """Smooth surrogate for angular ordering with band-hinge target.
 
-    s_cone = mean( σ( κ · ( -Z - m_smooth ) ) )
+    Despite this loss being historically labelled "cone occupancy", the
+    forward computation does NOT measure volumetric cone occupancy: it does
+    not reference the aperture B at all. It measures angular ordering on the
+    hyperboloid — the soft fraction of (Q, K) pairs in which K lies in the
+    angular half-space "deeper" than Q (i.e., Z < 0 at vertex Q), regardless
+    of the half-angle β subtended by Q's entailment cone.
 
-    Penalises when s_cone falls outside the band [s_lo, s_hi].
+    Surrogate:
+        s_angular = mean( σ( κ · ( -Z - m_smooth ) ) )
+
+    A pair contributes ≈ 1 when Z < 0 (K geometrically deeper than Q at
+    vertex Q) and ≈ 0 when Z > 0 (sibling/shallower geometry). The earlier
+    formulation cone_score = -(B + Z) - m_smooth was replaced by -Z to block
+    a β-collapse loophole: the optimizer was satisfying the constraint by
+    inflating β rather than moving tokens, producing trivial-looking
+    occupancy with no geometric content.
+
+    The band [s_lo, s_hi] is enforced on this angular fraction: if it falls
+    outside the target window the squared hinge penalty kicks in.
+
+    P1: Reduction is computed over geometrically valid Q-K pairs only
+    (those with norm_sq_QK > 1e-6 AND norm_sq_OQ > 1e-6). Masked pairs are
+    excluded entirely; they do not drag the mean toward the band-satisfying
+    value σ(−0.2) ≈ 0.45 that would otherwise auto-satisfy the loss when
+    the masking rate is high.
     """
     def __init__(self,
                  s_lo: float = 0.10,
@@ -89,13 +202,19 @@ class ConeOccupancyLoss(nn.Module):
 
     def forward(self, model, x, y, device):
         mha = _get_last_haa_mha(model)
-        if mha is None or mha._last_B is None or mha._last_Z is None:
+        if mha is None or getattr(mha, '_last_Z', None) is None or getattr(mha, '_last_valid_mask', None) is None:
             return torch.zeros((), device=device)
         Z = mha._last_Z
+        valid = getattr(mha, '_last_valid_mask', None)
+        if valid is None or not valid.any():
+            return torch.zeros((), device=device)
         # REPLACED -(B+Z) WITH -Z: Breaks the cheap beta-collapse gradient path.
         # Occupancy must be satisfied by moving Z structurally, not inflating beta.
         cone_score = -Z - self.m_smooth
-        s_cone = torch.sigmoid(self.kappa * cone_score).mean()
+        sigmoid_vals = torch.sigmoid(self.kappa * cone_score)
+        valid_f = valid.float()
+        n_valid = valid_f.sum().clamp_min(1.0)
+        s_cone = (sigmoid_vals * valid_f).sum() / n_valid
         loss_lo = F.relu(self.s_lo - s_cone).pow(2)
         loss_hi = F.relu(s_cone - self.s_hi).pow(2)
         return loss_lo + loss_hi
@@ -221,20 +340,170 @@ class HyperbolicHierarchyLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Hyperbolic Prototype Loss (P5)
+# ---------------------------------------------------------------------------
+class HyperbolicPrototypeLoss(nn.Module):
+    """Squared Lorentz distance from CLS embedding to fixed fine-class prototype.
+
+    Math (validated):
+      inner = -<cls, p_y>_L
+      arg   = inner / K
+      u     = max(arg - 1, 0)
+      acosh = log1p(u + sqrt(u·(2+u) + 1e-12))   [closed-form, no torch.acosh]
+      L     = mean(acosh²)
+
+    The closed-form identity arccosh(1+u) = log1p(u + sqrt(u(2+u))) avoids
+    the 1/sqrt(arg-1) singularity in the standard arccosh derivative.
+    Combined with the outer ()², the gradient at coincident points is
+    exactly zero (validated under static gradient checks).
+    """
+    def __init__(self,
+                 K: float,
+                 prototypes_lorentz: torch.Tensor,
+                 num_super: int,
+                 warmup: int = 5,
+                 ramp: int = 25,
+                 plateau: float = 0.5):
+        super().__init__()
+        self.K = K
+        self.num_super = num_super
+        self.register_buffer('prototypes', prototypes_lorentz, persistent=False)
+        self.schedule = RampSchedule(warmup, ramp, plateau)
+
+    def forward(self, model, x, y, device):
+        mha = _get_last_haa_mha(model)
+        if mha is None or getattr(mha, '_last_cls_lorentz', None) is None:
+            return torch.zeros((), device=device)
+        cls = mha._last_cls_lorentz  # [B, hidden_dim]
+        p_fine = self.prototypes[self.num_super + y]  # [B, hidden_dim]
+        inner = (-cls[..., 0:1] * p_fine[..., 0:1]
+                 + (cls[..., 1:] * p_fine[..., 1:]).sum(-1, keepdim=True))
+        arg = -inner / self.K
+        u = (arg - 1.0).clamp_min(0.0)
+        sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
+        acosh_val = torch.log1p(u + sqrt_term)
+        return acosh_val.pow(2).mean()
+
+
+# ---------------------------------------------------------------------------
+# Radial Variance Loss (P5)
+# ---------------------------------------------------------------------------
+class RadialVarianceLoss(nn.Module):
+    """One-sided hinge on c̃_batch population variance.
+
+    Math (validated):
+      c_tilde = sqrt(K) · log1p(u + sqrt(u·(2+u) + 1e-12))   with u = max(x_0/sqrt(K) - 1, 0)
+      σ²_batch = c_tilde.var(unbiased=False)
+      L = ReLU(σ²_target - σ²_batch)²
+
+    Population variance (unbiased=False) avoids the 1/(B-1) blowup at
+    batch size 2 and is the correct estimator for a regulariser. Below
+    target: linear-in-deficit gradient. Above target: zero (saturated).
+    Batch < 2 is guarded.
+    """
+    def __init__(self,
+                 K: float,
+                 sigma2_target: float = 0.10,
+                 warmup: int = 5,
+                 ramp: int = 25,
+                 plateau: float = 0.5):
+        super().__init__()
+        self.K = K
+        self.sqrt_K = K ** 0.5
+        self.sigma2_target = sigma2_target
+        self.schedule = RampSchedule(warmup, ramp, plateau)
+
+    def forward(self, model, x, y, device):
+        mha = _get_last_haa_mha(model)
+        if mha is None or getattr(mha, '_last_cls_lorentz', None) is None:
+            return torch.zeros((), device=device)
+        cls = mha._last_cls_lorentz  # [B, hidden_dim]
+        if cls.shape[0] < 2:
+            return torch.zeros((), device=device)
+        time = cls[..., 0:1]
+        arg = time / self.sqrt_K
+        u = (arg - 1.0).clamp_min(0.0)
+        sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
+        c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)
+        c_tilde = c_tilde.squeeze(-1)
+        var = c_tilde.var(unbiased=False)
+        deficit = F.relu(self.sigma2_target - var)
+        return deficit.pow(2)
+
+
+# ---------------------------------------------------------------------------
+# Beta-Cap Loss (P5)
+# ---------------------------------------------------------------------------
+class BetaCapLoss(nn.Module):
+    """Cap β to the geometric envelope of the batch.
+
+    Math (validated):
+      target = sinh(quantile(c_tilde_batch, q))   [DETACHED — no grad through]
+      L = mean over heads of ReLU(β_h - target)²
+
+    Path A (dynamic, default): target recomputed from each batch's c̃ percentile.
+    Path B (static): target frozen at value passed via static_target argument.
+
+    Gradient flows only into β_raw via softplus parameterisation; the
+    quantile is detached so the non-smooth order-statistic gradient
+    never propagates. Saturated (β ≤ target): grad = 0. batch < 4 guarded.
+    """
+    def __init__(self,
+                 K: float,
+                 percentile: float = 0.25,
+                 static_target: float = None,
+                 warmup: int = 20,
+                 ramp: int = 20,
+                 plateau: float = 0.3):
+        super().__init__()
+        self.K = K
+        self.sqrt_K = K ** 0.5
+        self.percentile = percentile
+        self.static_target = static_target
+        self.schedule = RampSchedule(warmup, ramp, plateau)
+
+    def forward(self, model, x, y, device):
+        mha = _get_last_haa_mha(model)
+        if mha is None or getattr(mha, '_last_all_tokens_lorentz', None) is None:
+            return torch.zeros((), device=device)
+
+        beta = F.softplus(mha.beta_raw)  # [H] after Stage 1.1, else [1]
+
+        if self.static_target is not None:
+            target = torch.sinh(torch.tensor(self.static_target, device=device))
+        else:
+            tokens = mha._last_all_tokens_lorentz  # [B, n, hidden_dim]
+            time = tokens[..., 0:1]
+            arg = time / self.sqrt_K
+            u = (arg - 1.0).clamp_min(0.0)
+            sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
+            c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)
+            c_flat = c_tilde.detach().flatten()
+            if c_flat.numel() < 4:
+                return torch.zeros((), device=device)
+            target = torch.sinh(torch.quantile(c_flat, self.percentile))
+
+        return F.relu(beta - target).pow(2).mean()
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 def build_aux_losses(args):
     """Construct auxiliary loss modules controlled by CLI flags.
 
-    Returns a dict ``{'occupancy': ..., 'hhl': ...}`` where each entry is
-    either an ``nn.Module`` or ``None`` if disabled (gamma_max/eta_max == 0).
+    Returns a dict with keys 'angular', 'hhl', 'proto', 'radvar', 'betacap'
+    where each entry is either an ``nn.Module`` or ``None`` if disabled
+    (its corresponding *_max weight is 0). The training loop iterates the
+    dict and skips None entries.
     """
-    out = {'occupancy': None, 'hhl': None}
+    out = {'angular': None, 'hhl': None,
+           'proto': None, 'radvar': None, 'betacap': None}
 
-    gamma_max = float(getattr(args, 'gamma_max', 0.0))
+    gamma_max = float(getattr(args, 'gamma_angular_max', 0.0))
     if gamma_max > 0:
-        out['occupancy'] = ConeOccupancyLoss(
-            warmup=int(getattr(args, 'gamma_warmup', 15)),
+        out['angular'] = DirectionalAngularLoss(
+            warmup=int(getattr(args, 'gamma_angular_warmup', 15)),
             ramp=25,
             plateau=gamma_max,
         )
@@ -247,6 +516,47 @@ def build_aux_losses(args):
             warmup=int(getattr(args, 'eta_warmup', 5)),
             ramp=25,
             plateau=eta_max,
+        )
+
+    eta_proto_max = float(getattr(args, 'eta_proto_max', 0.0))
+    if eta_proto_max > 0:
+        K = float(getattr(args, 'encoder_k', 1.0))
+        prototypes = getattr(args, 'hyperbolic_prototypes', None)
+        if prototypes is None:
+            raise RuntimeError(
+                "L_proto enabled but args.hyperbolic_prototypes not set. "
+                "Build prototypes in the model setup before constructing aux losses.")
+        out['proto'] = HyperbolicPrototypeLoss(
+            K=K,
+            prototypes_lorentz=prototypes,
+            num_super=int(getattr(args, 'num_super', NUM_SUPER)),
+            warmup=int(getattr(args, 'eta_proto_warmup', 5)),
+            ramp=25,
+            plateau=eta_proto_max,
+        )
+
+    zeta_radvar_max = float(getattr(args, 'zeta_radvar_max', 0.0))
+    if zeta_radvar_max > 0:
+        K = float(getattr(args, 'encoder_k', 1.0))
+        out['radvar'] = RadialVarianceLoss(
+            K=K,
+            sigma2_target=float(getattr(args, 'sigma2_target', 0.10)),
+            warmup=int(getattr(args, 'zeta_radvar_warmup', 5)),
+            ramp=25,
+            plateau=zeta_radvar_max,
+        )
+
+    xi_betacap_max = float(getattr(args, 'xi_betacap_max', 0.0))
+    if xi_betacap_max > 0:
+        K = float(getattr(args, 'encoder_k', 1.0))
+        static_t = getattr(args, 'betacap_static_target', None)
+        out['betacap'] = BetaCapLoss(
+            K=K,
+            percentile=float(getattr(args, 'betacap_percentile', 0.25)),
+            static_target=float(static_t) if static_t is not None else None,
+            warmup=int(getattr(args, 'xi_betacap_warmup', 20)),
+            ramp=20,
+            plateau=xi_betacap_max,
         )
 
     return out

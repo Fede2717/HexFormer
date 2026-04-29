@@ -109,7 +109,8 @@ def compute_Z(q: torch.Tensor, k: torch.Tensor, K: float) -> torch.Tensor:
     numer_Z    = inner_OK + (inner_QK * inner_OQ) / K
     denom = torch.sqrt(norm_sq_QK + 1e-12) * torch.sqrt(norm_sq_OQ + 1e-12)
     Z_raw = numer_Z / denom
-    mask_valid = (norm_sq_OQ > 1e-6).expand_as(Z_raw)
+    # A5 parity: symmetric in Q and K (must mirror transformer_blocks.py).
+    mask_valid = ((norm_sq_QK > 1e-6) & (norm_sq_OQ > 1e-6)).expand_as(Z_raw)
     nan_mask = torch.isnan(Z_raw)
     return torch.where(mask_valid & ~nan_mask,
                        Z_raw.clamp(-1.0, 1.0),
@@ -187,11 +188,23 @@ def log_haa_epoch_metrics(model, epoch: int, writer) -> None:
                         f"[HAA layer {l}] grad_norm_{param_name}={norm_val:.3e} "
                         f"outside expected range [1e-3, 1e0]")
 
-        # STEP 0 Action C: z_nan_element_rate — log and reset per epoch.
+        # P4: log all three Z-failure rates against the same denominator
+        # (total Z elements seen this epoch) and reset every counter so
+        # the throttled-print modulus does not diverge across epochs.
         elem_rate = mha._z_nan_element_count / max(1, mha._z_nan_element_total)
         log_fn(f"haa/layer_{l}/z_nan_element_rate", elem_rate)
+        nearzero_qk_rate = mha._z_nearzero_qk_count / max(1, mha._z_nan_element_total)
+        log_fn(f"haa/layer_{l}/z_nearzero_qk_rate", nearzero_qk_rate)
+        origin_rate = mha._z_origin_count / max(1, mha._z_nan_element_total)
+        log_fn(f"haa/layer_{l}/z_origin_rate", origin_rate)
+
+        # Reset ALL counters per epoch — fixes the throttled-print divergence.
+        mha._z_nan_batch_count = 0
+        mha._z_nan_total_calls = 0
         mha._z_nan_element_count = 0
         mha._z_nan_element_total = 0
+        mha._z_nearzero_qk_count = 0
+        mha._z_origin_count = 0
 
 
 def log_haa_deep_diagnostics(model, val_loader, device: str,
