@@ -18,6 +18,7 @@ def make_args(**overrides):
         zeta_radvar_max=0.0,
         xi_betacap_max=0.0,
         eta_max=0.0,
+        use_cls_depth_residual=False,
     )
     for k, v in overrides.items():
         setattr(a, k, v)
@@ -52,3 +53,13 @@ def test_idempotent_train_eval():
 def test_zero_value_omitted():
     a = make_args(eta_proto_max=0.0, zeta_radvar_max=0.05)
     assert resolve_run_name(a.run_name, a) == 'base_radvar0.05'
+
+
+def test_clsres_appended():
+    a = make_args(use_cls_depth_residual=True)
+    assert resolve_run_name(a.run_name, a) == 'base_clsres'
+
+
+def test_clsres_with_other_flags():
+    a = make_args(eta_proto_max=0.1, use_cls_depth_residual=True)
+    assert resolve_run_name(a.run_name, a) == 'base_proto0.1_clsres'

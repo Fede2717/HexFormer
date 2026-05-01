@@ -43,6 +43,7 @@ class ViT(nn.Module):
         beta_init_override=None,
         B_smooth='softplus',
         B_softplus_temp=4.0,
+        use_cls_depth_residual=False,
     ):
         super(ViT, self).__init__()
         self.manifold = manifold
@@ -99,6 +100,23 @@ class ViT(nn.Module):
             print(f"[HAA INIT] Verified {n_haa} HAA layers with valid layer_idx assignment.",
                   flush=True)
 
+        # Stage 2.1 Path B (revised): per-CLS radial scaling residual.
+        # Decouples CLS depth from spatial norm so L_proto / L_radvar operate
+        # on an actual depth DOF. Active only when use_cls_depth_residual=True.
+        self.use_cls_depth_residual = use_cls_depth_residual
+        if use_cls_depth_residual:
+            if type(self.manifold) is not CustomLorentz:
+                raise RuntimeError(
+                    "CLS depth residual requires the Lorentz manifold; "
+                    f"got {type(self.manifold)}")
+            from classification_vit.cls_depth_residual import CLSDepthResidual
+            self.cls_depth_residual = CLSDepthResidual(
+                manifold=self.manifold,
+                hidden_dim_lorentz=hidden_dim + 1,
+            )
+        else:
+            self.cls_depth_residual = None
+
         self.final_ln = self._get_layerNorm(hidden_dim)
 
         if remove_linear:
@@ -108,10 +126,20 @@ class ViT(nn.Module):
 
         self.apply(init_weights)
 
+        # Re-zero the CLS depth residual MLP final layer AFTER apply(init_weights),
+        # which would otherwise xavier-init it and break the alpha=1.0 init guarantee.
+        if self.cls_depth_residual is not None:
+            nn.init.zeros_(self.cls_depth_residual.mlp[-1].weight)
+            nn.init.zeros_(self.cls_depth_residual.mlp[-1].bias)
+            nn.init.normal_(self.cls_depth_residual.mlp[0].weight, std=0.01)
+            nn.init.zeros_(self.cls_depth_residual.mlp[0].bias)
+
     def forward(self, x):
         x = self.patchify(x)
         x = self.embed(x)
-        x = self.encoder(x)[:, 0]
+        x = self.encoder(x)[:, 0]            # [B, hidden_dim+1] CLS Lorentz
+        if self.cls_depth_residual is not None:
+            x = self.cls_depth_residual(x)   # decouples depth from spatial norm
         x = self.final_ln(x)
 
         if self.predictor is not None:

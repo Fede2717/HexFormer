@@ -111,6 +111,9 @@ def select_model(img_dim, num_classes, args):
     enc_args['B_softplus_temp'] = getattr(args, 'B_softplus_temp', 4.0)
     # STEP 4 / CHANGE-3: optional override of β init for all HAA layers
     enc_args['beta_init_override'] = getattr(args, 'beta_init_override', None)
+    # Stage 2.1 Path B (revised): per-CLS radial scaling residual toggle.
+    enc_args['use_cls_depth_residual'] = getattr(
+        args, 'use_cls_depth_residual', False)
 
     if (args.encoder_manifold=="lorentz") or (args.encoder_manifold=="poincare"):
         enc_args['learn_k'] = args.learn_k

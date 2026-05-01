@@ -8,11 +8,12 @@ appended in the order listed in ``_AUX_FLAGS`` (NOT alphabetical), joined by
 # Order matters — keep stable across releases.
 # (cli_flag_name, suffix_token, formatter)
 _AUX_FLAGS = [
-    ('gamma_angular_max',   'angular',  lambda v: f"angular{v:g}"),
-    ('eta_proto_max',       'proto',    lambda v: f"proto{v:g}"),
-    ('zeta_radvar_max',     'radvar',   lambda v: f"radvar{v:g}"),
-    ('xi_betacap_max',      'betacap',  lambda v: f"betacap{v:g}"),
-    ('eta_max',             'hhl',      lambda v: f"hhl{v:g}"),
+    ('gamma_angular_max',     'angular',  lambda v: f"angular{v:g}"),
+    ('eta_proto_max',         'proto',    lambda v: f"proto{v:g}"),
+    ('zeta_radvar_max',       'radvar',   lambda v: f"radvar{v:g}"),
+    ('xi_betacap_max',        'betacap',  lambda v: f"betacap{v:g}"),
+    ('eta_max',               'hhl',      lambda v: f"hhl{v:g}"),
+    ('use_cls_depth_residual','clsres',   lambda v: 'clsres'),
 ]
 
 

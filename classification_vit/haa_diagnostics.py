@@ -166,11 +166,8 @@ def log_haa_epoch_metrics(model, epoch: int, writer) -> None:
         key=lambda x: x[0]
     )
 
-    if not haa_mhas:
-        return
-
-    first_haa = haa_mhas[0][0]
-    last_haa  = haa_mhas[-1][0]
+    first_haa = haa_mhas[0][0] if haa_mhas else None
+    last_haa  = haa_mhas[-1][0] if haa_mhas else None
 
     for l, mha in haa_mhas:
         log_fn(f"haa/layer_{l}/beta",             mha.haa_alpha)
@@ -205,6 +202,21 @@ def log_haa_epoch_metrics(model, epoch: int, writer) -> None:
         mha._z_nan_element_total = 0
         mha._z_nearzero_qk_count = 0
         mha._z_origin_count = 0
+
+    # Stage 2.1 Path B telemetry — CLS depth residual.
+    # Lives on the inner ViT (base.encoder for ViTClassifier wrapper).
+    cls_resid = getattr(base, 'cls_depth_residual', None)
+    if cls_resid is None:
+        cls_resid = getattr(getattr(base, 'encoder', None),
+                            'cls_depth_residual', None)
+    if cls_resid is not None and cls_resid._last_alpha is not None:
+        a = cls_resid._last_alpha.float()
+        log_fn("cls_residual/alpha_mean", a.mean().item())
+        log_fn("cls_residual/alpha_std",  a.std().item() if a.numel() > 1 else 0.0)
+        log_fn("cls_residual/alpha_min",  a.min().item())
+        log_fn("cls_residual/alpha_max",  a.max().item())
+        log_fn("cls_residual/alpha_grad_norm",
+               float(getattr(cls_resid, '_last_alpha_grad', 0.0)))
 
 
 def log_haa_deep_diagnostics(model, val_loader, device: str,

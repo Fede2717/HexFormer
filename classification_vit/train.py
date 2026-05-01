@@ -178,6 +178,12 @@ def getArguments():
     parser.add_argument('--d_f_low', type=float, default=0.5)
     parser.add_argument('--d_f_high', type=float, default=1.85)
 
+    parser.add_argument('--use_cls_depth_residual', action='store_true',
+        help="Stage 2.1 Path B: enable per-CLS radial scaling residual "
+             "alpha = 1 + 0.8*tanh(MLP(cls_spatial)) before the classifier. "
+             "Decouples CLS depth from spatial norm so L_proto / L_radvar "
+             "operate on an actual depth degree of freedom.")
+
     args = parser.parse_args()
 
     if args.gamma_max is not None:
@@ -350,6 +356,8 @@ def main(args):
         'frac_near_origin': [],
         'grad_norm_B':      [],
         'grad_norm_c_tilde':[],
+        'alpha_mean':       [],
+        'alpha_grad_norm':  [],
     }
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -471,6 +479,20 @@ def main(args):
                 _haa_epoch_data['grad_norm_B'].append(_last_mha._grad_norms.get('B', ''))
                 _haa_epoch_data['grad_norm_c_tilde'].append(_last_mha._grad_norms.get('c_tilde', ''))
 
+            # Stage 2.1 Path B: per-CLS radial scaling residual telemetry.
+            _cls_resid = getattr(_base, 'cls_depth_residual', None)
+            if _cls_resid is None:
+                _cls_resid = getattr(getattr(_base, 'encoder', None),
+                                     'cls_depth_residual', None)
+            if _cls_resid is not None and _cls_resid._last_alpha is not None:
+                _haa_epoch_data['alpha_mean'].append(
+                    _cls_resid._last_alpha.float().mean().item())
+                _haa_epoch_data['alpha_grad_norm'].append(
+                    float(getattr(_cls_resid, '_last_alpha_grad', 0.0)))
+            else:
+                _haa_epoch_data['alpha_mean'].append('')
+                _haa_epoch_data['alpha_grad_norm'].append('')
+
             # Append the validation metrics for this epoch
             val_losses.append(loss_val)
             val_acc1s.append(acc1_val)
@@ -524,6 +546,7 @@ def main(args):
                 "haa_cone_sparsity", "haa_z_mean",
                 "haa_frac_near_origin",
                 "haa_grad_norm_B", "haa_grad_norm_c_tilde",
+                "cls_alpha_mean", "cls_alpha_grad_norm",
             ])
             for i in range(args.num_epochs):
                 writer_csv.writerow([
@@ -539,6 +562,8 @@ def main(args):
                     _haa_epoch_data['frac_near_origin'][i] if i < len(_haa_epoch_data['frac_near_origin']) else '',
                     _haa_epoch_data['grad_norm_B'][i]      if i < len(_haa_epoch_data['grad_norm_B']) else '',
                     _haa_epoch_data['grad_norm_c_tilde'][i] if i < len(_haa_epoch_data['grad_norm_c_tilde']) else '',
+                    _haa_epoch_data['alpha_mean'][i]      if i < len(_haa_epoch_data['alpha_mean']) else '',
+                    _haa_epoch_data['alpha_grad_norm'][i] if i < len(_haa_epoch_data['alpha_grad_norm']) else '',
                 ])
         print(f"Metrics saved to {metrics_file}")
 
