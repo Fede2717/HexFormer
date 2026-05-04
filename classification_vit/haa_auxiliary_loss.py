@@ -343,7 +343,12 @@ class HyperbolicHierarchyLoss(nn.Module):
 # Hyperbolic Prototype Loss (P5)
 # ---------------------------------------------------------------------------
 class HyperbolicPrototypeLoss(nn.Module):
-    """Squared Lorentz distance from CLS embedding to fixed fine-class prototype.
+    """Squared Lorentz distance from CLS embedding to fixed superclass prototype.
+
+    FIX-PROTO-DEPTH: CLS is the aggregated global concept; pulling it toward
+    a fine-class prototype (depth d_s + d_f) inflates CLS depth past the
+    abstract level. Pull toward the parent superclass prototype (depth d_s)
+    instead.
 
     Math (validated):
       inner = -<cls, p_y>_L
@@ -370,14 +375,26 @@ class HyperbolicPrototypeLoss(nn.Module):
         self.register_buffer('prototypes', prototypes_lorentz, persistent=False)
         self.schedule = RampSchedule(warmup, ramp, plateau)
 
+        # FIX-PROTO-DEPTH: CLS is the aggregated global concept and must be
+        # pulled to the abstract (superclass) depth d_s, not the fine-class
+        # depth band. Need fine→super LUT to look up the super prototype.
+        _lut = torch.zeros(NUM_FINE, dtype=torch.long)
+        for fine, sup in FINE_TO_SUPER.items():
+            _lut[fine] = sup
+        self.register_buffer('fine_to_super_lut', _lut, persistent=False)
+
     def forward(self, model, x, y, device):
         mha = _get_last_haa_mha(model)
         if mha is None or getattr(mha, '_last_cls_lorentz', None) is None:
             return torch.zeros((), device=device)
         cls = mha._last_cls_lorentz  # [B, hidden_dim]
-        p_fine = self.prototypes[self.num_super + y]  # [B, hidden_dim]
-        inner = (-cls[..., 0:1] * p_fine[..., 0:1]
-                 + (cls[..., 1:] * p_fine[..., 1:]).sum(-1, keepdim=True))
+        # FIX-PROTO-DEPTH: pull CLS toward the superclass prototype (depth d_s),
+        # not the fine-class prototype (depth d_s + d_f). Super-prototypes live
+        # at indices [0 : num_super] in the prototypes tensor.
+        super_labels = self.fine_to_super_lut[y]
+        target_proto = self.prototypes[super_labels]  # [B, hidden_dim]
+        inner = (-cls[..., 0:1] * target_proto[..., 0:1]
+                 + (cls[..., 1:] * target_proto[..., 1:]).sum(-1, keepdim=True))
         arg = -inner / self.K
         u = (arg - 1.0).clamp_min(0.0)
         sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)

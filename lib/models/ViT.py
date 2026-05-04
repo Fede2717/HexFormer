@@ -128,9 +128,12 @@ class ViT(nn.Module):
 
         # Re-zero the CLS depth residual MLP final layer AFTER apply(init_weights),
         # which would otherwise xavier-init it and break the alpha=1.0 init guarantee.
+        # FIX-ALPHA-INIT: under alpha = 0.2 + softplus(raw), bias must equal
+        # softplus_inv(0.8) = log(exp(0.8) - 1) ≈ 0.2036 to keep alpha=1.0 at init.
         if self.cls_depth_residual is not None:
             nn.init.zeros_(self.cls_depth_residual.mlp[-1].weight)
-            nn.init.zeros_(self.cls_depth_residual.mlp[-1].bias)
+            nn.init.constant_(self.cls_depth_residual.mlp[-1].bias,
+                              math.log(math.exp(0.8) - 1.0))
             nn.init.normal_(self.cls_depth_residual.mlp[0].weight, std=0.01)
             nn.init.zeros_(self.cls_depth_residual.mlp[0].bias)
 
