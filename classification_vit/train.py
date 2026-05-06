@@ -172,7 +172,6 @@ def getArguments():
     parser.add_argument('--xi_betacap_warmup', type=int, default=20)
     parser.add_argument('--betacap_percentile', type=float, default=0.25)
     parser.add_argument('--betacap_static_target', type=float, default=None)
-    parser.add_argument('--baseline_cls_emb_path', type=str, default=None)
     parser.add_argument('--proto_seed', type=int, default=42)
     parser.add_argument('--d_s', type=float, default=0.3)
     parser.add_argument('--d_f_low', type=float, default=0.5)
@@ -312,7 +311,11 @@ def main(args):
         if args.deep_diagnostics:
             _base_m = model.module if hasattr(model, 'module') else model
             _K = _base_m.enc_manifold.k.item()
+            _cuda_rng = torch.cuda.get_rng_state_all()
+            _cpu_rng  = torch.get_rng_state()
             log_haa_deep_diagnostics(model, val_loader, device, start_epoch, _K, writer)
+            torch.cuda.set_rng_state_all(_cuda_rng)
+            torch.set_rng_state(_cpu_rng)
         writer.close()
         return
 
@@ -373,37 +376,49 @@ def main(args):
             y = y.to(device)
             y_original = y.clone()  # preserve for HHL aux loss
 
-            # Cutmix and Mixup
+            # Track mix state so aux losses can use the correct labels.
+            mixing_occurred = False
+            y_a, y_b, lam = y_original, y_original, 1.0
+
             r = np.random.rand(1)
             mix_prob = 0.5
             if r < mix_prob:
                 switching_prob = np.random.rand(1)
-
-                # Cutmix
                 if switching_prob < 0.5:
                     slicing_idx, y_a, y_b, lam, sliced = cutmix_data(x, y)
-                    x[:, :, slicing_idx[0]:slicing_idx[2], slicing_idx[1]:slicing_idx[3]] = sliced
+                    x[:, :, slicing_idx[0]:slicing_idx[2],
+                          slicing_idx[1]:slicing_idx[3]] = sliced
                     output = model(x)
-                    
-                    loss =  mixup_criterion(criterion, output, y_a, y_b, lam)
-                # Mixup
+                    loss = mixup_criterion(criterion, output, y_a, y_b, lam)
+                    mixing_occurred = True
                 else:
                     x, y_a, y_b, lam = mixup_data(x, y)
                     output = model(x)
-                    
-                    loss = mixup_criterion(criterion, output, y_a, y_b, lam) 
+                    loss = mixup_criterion(criterion, output, y_a, y_b, lam)
+                    mixing_occurred = True
             else:
                 output = model(x)
                 loss = criterion(output, y)
 
-            # STEP 3 / CHANGE-4: aux-loss accumulation block. Single insertion
-            # point — no aux logic anywhere else in train.py.
+            # Mixup-aware aux-loss accumulation.
+            # Label-conditioned losses (proto, hhl) receive the lam-weighted sum
+            # over the two mixed labels. Label-independent losses (angular, radvar,
+            # betacap) ignore y entirely and are called once with y_original.
+            LABEL_CONDITIONED = {'proto', 'hhl'}
             loss_total = loss
             for _aux_name, _aux_fn in aux_losses.items():
-                if _aux_fn is not None:
-                    _w = _aux_fn.schedule(epoch)
-                    if _w > 0:
-                        loss_total = loss_total + _w * _aux_fn(model, x, y_original, device)
+                if _aux_fn is None:
+                    continue
+                _w = _aux_fn.schedule(epoch)
+                if _w <= 0:
+                    continue
+                if mixing_occurred and _aux_name in LABEL_CONDITIONED:
+                    _lam_t = float(lam) if not torch.is_tensor(lam) else lam.item()
+                    _loss_aux = (_lam_t * _aux_fn(model, x, y_a, device)
+                                 + (1.0 - _lam_t) * _aux_fn(model, x, y_b, device))
+                else:
+                    _loss_aux = _aux_fn(model, x, y_original, device)
+                loss_total = loss_total + _w * _loss_aux
 
             optimizer.zero_grad()
             loss_total.backward()
@@ -516,7 +531,11 @@ def main(args):
         if args.deep_diagnostics and ((epoch+1) in {1,5,10,20}
                                        or (epoch+1) == args.num_epochs):
             _K = model.module.enc_manifold.k.item()
+            _cuda_rng = torch.cuda.get_rng_state_all()
+            _cpu_rng  = torch.get_rng_state()
             log_haa_deep_diagnostics(model, val_loader, device, epoch, _K, writer)
+            torch.cuda.set_rng_state_all(_cuda_rng)
+            torch.set_rng_state(_cpu_rng)
         # ------- End validation and logging -------
 
     print("-----------------\nTraining finished\n-----------------")

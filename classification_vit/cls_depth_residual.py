@@ -67,7 +67,7 @@ class CLSDepthResidual(nn.Module):
         if self.training and alpha.requires_grad:
             alpha.register_hook(
                 lambda g: setattr(self, '_last_alpha_grad',
-                                  g.detach().norm().item()))
+                                  g.detach().abs().mean().item()))
 
         cls_spatial_new = alpha.unsqueeze(-1) * cls_spatial   # [B, spatial_dim]
         cls_lorentz_new = self.manifold.add_time(cls_spatial_new)

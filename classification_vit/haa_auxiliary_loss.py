@@ -33,7 +33,6 @@ def build_hyperbolic_prototypes(num_super: int,
                                 hidden_dim: int,
                                 fine_to_super_lut: torch.Tensor,
                                 K: float = 1.0,
-                                baseline_cls_embeddings: torch.Tensor = None,
                                 seed: int = 42,
                                 d_s: float = 0.3,
                                 d_f_low: float = 0.5,
@@ -41,46 +40,41 @@ def build_hyperbolic_prototypes(num_super: int,
     """Construct fixed Lorentz prototypes for L_proto.
 
     Returns a tensor of shape [num_super + num_fine, hidden_dim].
-    Indices [0 : num_super] are super-prototypes, [num_super : num_super+num_fine]
-    are fine-prototypes.
+    Indices [0 : num_super] are super-prototypes (shallow, depth d_s).
+    Indices [num_super : num_super + num_fine] are fine-prototypes
+    (deep, depth d_s + d_f[c], inside parent's tan(pi/8) angular cap).
 
-    Depths:
-      - super: d_s (constant, 0.3 by default)
-      - fine:  d_s + d_f[c]  with d_f[c] ~ Uniform(d_f_low, d_f_high)
-        Default d_f range [0.5, 1.85] gives Var(d_f) = 1.35² / 12 ≈ 0.152,
-        which exceeds σ²_target=0.10 with ~50% margin (P6 reconciliation).
+    Super angular positions: closed-form simplex ETF. C = num_super vectors
+    in spatial space with all pairwise cosines = -1/(C-1). Maximally and
+    uniformly separated by construction. Dataset-independent: depends only
+    on (num_super, num_fine, spatial_dim, fine_to_super_lut).
 
-    Angular positions:
-      - super angles v_s: top num_super principal components of
-        baseline_cls_embeddings if provided; else random orthonormal via QR.
-      - fine angles w_c: for each c with super(c)=s, sample δ ∈ R^(hidden_dim-1),
-        project onto orthogonal complement of v_s, scale to tan(π/8) magnitude,
-        and renormalise (v_s + δ_perp) to unit norm.
+    Fine angular positions: for each fine class c with super(c) = s, sample
+    delta in R^spatial_dim, project onto the orthogonal complement of v_s,
+    scale to tan(pi/8) magnitude, renormalise (v_s + delta_perp) to unit
+    norm. Each fine prototype lies inside its parent's angular cap.
 
     Final spatial = unit_vec * sinh(depth); time = sqrt(K) * cosh(depth).
-    Concatenated as [time, spatial] to form Lorentz point.
     """
     g = torch.Generator().manual_seed(seed)
     sqrt_K = K ** 0.5
     spatial_dim = hidden_dim - 1
 
-    # --- super angles ---
-    if baseline_cls_embeddings is not None:
-        spatial_emb = baseline_cls_embeddings[..., 1:]  # drop time coord
-        spatial_emb = spatial_emb - spatial_emb.mean(dim=0, keepdim=True)
-        U, S, Vh = torch.linalg.svd(spatial_emb, full_matrices=False)
-        if Vh.shape[0] < num_super:
-            raise ValueError(
-                f"baseline embeddings have only {Vh.shape[0]} principal components, "
-                f"need {num_super}")
-        super_angles = Vh[:num_super]  # [num_super, spatial_dim]
-    else:
-        rand_mat = torch.randn(spatial_dim, num_super, generator=g)
-        Q, _ = torch.linalg.qr(rand_mat)
-        super_angles = Q.T  # [num_super, spatial_dim]
+    # --- super angles via closed-form simplex ETF ---
+    # Mettes 2019 / neural-collapse canonical maximum-separation construction.
+    C = num_super
+    if spatial_dim < C - 1:
+        raise ValueError(
+            f"spatial_dim={spatial_dim} < num_super-1={C-1}; "
+            "simplex ETF requires spatial_dim >= num_super - 1.")
+    U_full = torch.randn(spatial_dim, C, generator=g)
+    U, _ = torch.linalg.qr(U_full)                           # [spatial_dim, C], semi-orthogonal
+    M_simplex = (math.sqrt(C / (C - 1.0)) *
+                 (torch.eye(C) - (1.0 / C) * torch.ones(C, C)))
+    super_angles = (U @ M_simplex).T                         # [C, spatial_dim]
     super_angles = super_angles / super_angles.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
-    # --- fine angles within parent super's cone ---
+    # --- fine angles within parent super's angular cap ---
     cap_tan = torch.tan(torch.tensor(math.pi / 8.0))
     fine_angles = torch.zeros(num_fine, spatial_dim)
     for c in range(num_fine):
@@ -186,8 +180,8 @@ class DirectionalAngularLoss(nn.Module):
     the masking rate is high.
     """
     def __init__(self,
-                 s_lo: float = 0.10,
-                 s_hi: float = 0.50,
+                 s_lo: float = 0.40,
+                 s_hi: float = 0.70,
                  kappa: float = 4.0,
                  m_smooth: float = 0.05,
                  warmup: int = 15,
@@ -343,12 +337,17 @@ class HyperbolicHierarchyLoss(nn.Module):
 # Hyperbolic Prototype Loss (P5)
 # ---------------------------------------------------------------------------
 class HyperbolicPrototypeLoss(nn.Module):
-    """Squared Lorentz distance from CLS embedding to fixed superclass prototype.
+    """Squared Lorentz distance from post-attention CLS to fixed FINE prototype.
 
-    FIX-PROTO-DEPTH: CLS is the aggregated global concept; pulling it toward
-    a fine-class prototype (depth d_s + d_f) inflates CLS depth past the
-    abstract level. Pull toward the parent superclass prototype (depth d_s)
-    instead.
+    FIX-PROTO-DEPTH (REVISED, Alternative 1): pull CLS toward the
+    fine-grained prototype at depth d_s + d_f[y], NOT the superclass
+    prototype at d_s. Reasoning: the classification head needs CLS deep
+    enough to discriminate ``num_fine`` classes; pulling CLS to the
+    shallow superclass depth compresses the classification angular
+    budget. The HAA depth-ordering requirement (Q-CLS shallower than
+    K-patch) is handled separately by an in-attention alpha_q control;
+    L_proto's job here is to supervise the post-encoder CLS for
+    classification, not to drive HAA geometry.
 
     Math (validated):
       inner = -<cls, p_y>_L
@@ -375,24 +374,24 @@ class HyperbolicPrototypeLoss(nn.Module):
         self.register_buffer('prototypes', prototypes_lorentz, persistent=False)
         self.schedule = RampSchedule(warmup, ramp, plateau)
 
-        # FIX-PROTO-DEPTH: CLS is the aggregated global concept and must be
-        # pulled to the abstract (superclass) depth d_s, not the fine-class
-        # depth band. Need fine→super LUT to look up the super prototype.
-        _lut = torch.zeros(NUM_FINE, dtype=torch.long)
-        for fine, sup in FINE_TO_SUPER.items():
-            _lut[fine] = sup
-        self.register_buffer('fine_to_super_lut', _lut, persistent=False)
-
     def forward(self, model, x, y, device):
         mha = _get_last_haa_mha(model)
         if mha is None or getattr(mha, '_last_cls_lorentz', None) is None:
             return torch.zeros((), device=device)
-        cls = mha._last_cls_lorentz  # [B, hidden_dim]
-        # FIX-PROTO-DEPTH: pull CLS toward the superclass prototype (depth d_s),
-        # not the fine-class prototype (depth d_s + d_f). Super-prototypes live
-        # at indices [0 : num_super] in the prototypes tensor.
-        super_labels = self.fine_to_super_lut[y]
-        target_proto = self.prototypes[super_labels]  # [B, hidden_dim]
+        cls = mha._last_cls_lorentz                          # [B, hidden_dim+1]
+        # FIX-PROTO-DEPTH (REVISED, Alternative 1):
+        # Pull post-attention CLS toward the fine-grained prototype at
+        # depth d_s + d_f[y], NOT the superclass prototype at d_s.
+        # Reasoning: the classification head needs CLS deep enough to
+        # discriminate 100 fine classes. Pulling CLS to the shallow
+        # superclass depth (0.3) compresses the classification angular
+        # budget. The HAA depth-ordering requirement (Q-CLS shallower than
+        # K-patch) is handled separately by the in-attention alpha_q
+        # control planned for Step 11; L_proto's job is to supervise the
+        # post-encoder CLS for classification, not to drive HAA geometry.
+        # Fine-prototypes occupy indices [num_super : num_super + num_fine]
+        # in self.prototypes.
+        target_proto = self.prototypes[self.num_super + y]   # [B, hidden_dim+1]
         inner = (-cls[..., 0:1] * target_proto[..., 0:1]
                  + (cls[..., 1:] * target_proto[..., 1:]).sum(-1, keepdim=True))
         arg = -inner / self.K
@@ -406,17 +405,24 @@ class HyperbolicPrototypeLoss(nn.Module):
 # Radial Variance Loss (P5)
 # ---------------------------------------------------------------------------
 class RadialVarianceLoss(nn.Module):
-    """One-sided hinge on c̃_batch population variance.
+    """One-sided hinge on within-image radial-depth variance at the
+    pre-MHA layer-8 input.
 
     Math (validated):
       c_tilde = sqrt(K) · log1p(u + sqrt(u·(2+u) + 1e-12))   with u = max(x_0/sqrt(K) - 1, 0)
-      σ²_batch = c_tilde.var(unbiased=False)
-      L = ReLU(σ²_target - σ²_batch)²
+      σ²_per_image = Var_n(c_tilde)         [population variance over tokens of one image]
+      σ²_batch     = mean over images
+      L            = ReLU(σ²_target - σ²_batch)²
 
-    Population variance (unbiased=False) avoids the 1/(B-1) blowup at
-    batch size 2 and is the correct estimator for a regulariser. Below
-    target: linear-in-deficit gradient. Above target: zero (saturated).
-    Batch < 2 is guarded.
+    The variance is computed across tokens within each image at the
+    pre-MHA layer-8 input, then averaged across the batch. HAA's score
+    formula derives c_tilde from Q = W_Q . token_input, so the c_tilde
+    distribution HAA actually consumes is fixed by the INPUT depth
+    distribution; supervising the post-block output would let the MLP
+    satisfy L_radvar without ever stratifying what HAA sees.
+    Population variance (unbiased=False) avoids the 1/(n-1) blowup at
+    n=2. Below target: linear-in-deficit gradient. Above target: zero
+    (saturated). Token count < 2 is guarded.
     """
     def __init__(self,
                  K: float,
@@ -432,20 +438,23 @@ class RadialVarianceLoss(nn.Module):
 
     def forward(self, model, x, y, device):
         mha = _get_last_haa_mha(model)
-        if mha is None or getattr(mha, '_last_cls_lorentz', None) is None:
+        if mha is None or getattr(mha, '_last_all_tokens_lorentz', None) is None:
             return torch.zeros((), device=device)
-        cls = mha._last_cls_lorentz  # [B, hidden_dim]
-        if cls.shape[0] < 2:
+        # Pre-MHA layer-8 input tokens. HAA's score formula computes
+        # c_tilde from Q = W_Q . token_input, so the c_tilde distribution
+        # HAA actually consumes is determined by the INPUT depth
+        # distribution. Supervising the post-block output would let the
+        # MLP satisfy L_radvar without ever stratifying what HAA sees.
+        tokens = mha._last_all_tokens_lorentz   # [B, n, hidden_dim+1]
+        if tokens.shape[0] < 1 or tokens.shape[1] < 2:
             return torch.zeros((), device=device)
-        time = cls[..., 0:1]
+        time = tokens[..., 0]                   # [B, n]
         arg = time / self.sqrt_K
         u = (arg - 1.0).clamp_min(0.0)
         sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
-        c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)
-        c_tilde = c_tilde.squeeze(-1)
-        var = c_tilde.var(unbiased=False)
-        deficit = F.relu(self.sigma2_target - var)
-        return deficit.pow(2)
+        c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)      # [B, n]
+        sigma2_per_image = c_tilde.var(dim=-1, unbiased=False)  # [B]
+        return F.relu(self.sigma2_target - sigma2_per_image.mean()).pow(2)
 
 
 # ---------------------------------------------------------------------------

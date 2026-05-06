@@ -66,6 +66,20 @@ class LorentzTransformerEncoder(nn.Module):
     def forward(self, x):
         out = self.mha(self.ln1(x))
         out = self.drop_path(out.narrow(-1, 1, x.shape[-1]-1)) + x.narrow(-1, 1, x.shape[-1]-1)
+
+        # Post-attention, pre-MLP CLS capture for L_proto.
+        # `out` here is spatial-only (the first residual operates on spatial
+        # coordinates). Re-project to Lorentz via add_time to produce a valid
+        # manifold point. add_time is differentiable; capture is gradient-
+        # preserving (no .detach()). This capture is correct pre-Step-11:
+        # L_proto's gradient flows back through W_Q at layer 8 with one
+        # residual split, providing the strongest HAA-depth supervision
+        # available before alpha_q is introduced. Move to post-block when
+        # Step 11 (alpha_q) lands.
+        if hasattr(self.mha, 'use_haa') and self.mha.use_haa:
+            _post_attn_full = self.manifold.add_time(out)
+            self.mha._last_cls_lorentz = _post_attn_full[:, 0, :]
+
         out = self.drop_path(self.mlp(self.ln2(self.manifold.add_time(out))).narrow(-1, 1, x.shape[-1]-1)) + out
         out = self.manifold.add_time(out)
         return out
@@ -180,9 +194,6 @@ class LorentzMultiHeadAttention(nn.Module):
             # STEP 3 / CHANGE-4: capture CLS token time coord (with gradient)
             # for HHL. q_time shape: [b, h, n, 1]; CLS is token index 0.
             self._last_cls_time = q_time[:, :, 0:1, :]
-            # P5: full CLS Lorentz embedding from head 0 — used by
-            # L_proto and L_radvar. Head 0 is chosen for determinism.
-            self._last_cls_lorentz = x[:, 0, :]   # [b, num_features] = [b, hidden_dim+1]
 
             sqrt_k = torch.sqrt(self.manifold.k)
             K = self.manifold.k

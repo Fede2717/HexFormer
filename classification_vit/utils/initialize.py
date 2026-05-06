@@ -1,6 +1,3 @@
-import os
-import warnings
-
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -34,22 +31,12 @@ def attach_hyperbolic_prototypes(model, args):
     for f, s in FINE_TO_SUPER.items():
         lut[f] = s
 
-    baseline_emb = None
-    baseline_path = getattr(args, 'baseline_cls_emb_path', None)
-    if baseline_path is not None and os.path.exists(baseline_path):
-        baseline_emb = torch.load(baseline_path, map_location='cpu')
-    elif baseline_path is not None:
-        warnings.warn(
-            f"L_proto enabled and baseline_cls_emb_path={baseline_path!r} "
-            "missing; falling back to random orthonormal super-prototype angles.")
-
     protos = build_hyperbolic_prototypes(
         num_super=NUM_SUPER,
         num_fine=NUM_FINE,
         hidden_dim=args.hidden_dim + 1,
         fine_to_super_lut=lut,
         K=float(getattr(args, 'encoder_k', 1.0)),
-        baseline_cls_embeddings=baseline_emb,
         seed=int(getattr(args, 'proto_seed', 42)),
         d_s=float(getattr(args, 'd_s', 0.3)),
         d_f_low=float(getattr(args, 'd_f_low', 0.5)),
