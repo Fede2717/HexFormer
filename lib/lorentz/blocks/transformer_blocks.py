@@ -79,6 +79,13 @@ class LorentzTransformerEncoder(nn.Module):
         if hasattr(self.mha, 'use_haa') and self.mha.use_haa:
             _post_attn_full = self.manifold.add_time(out)
             self.mha._last_cls_lorentz = _post_attn_full[:, 0, :]
+            # NEW: capture full post-attention token tensor for σ² diagnostic.
+            # Detached: this is for measurement only, not loss.
+            self.mha._last_post_attn_all_tokens = _post_attn_full.detach()
+            # POST-ATTENTION σ² accumulation (what L_proto supervises CLS at,
+            # extended to all tokens for the diagnostic).
+            self.mha._accumulate_sigma2(_post_attn_full,
+                                        'train_post' if self.mha.training else 'val_post')
 
         out = self.drop_path(self.mlp(self.ln2(self.manifold.add_time(out))).narrow(-1, 1, x.shape[-1]-1)) + out
         out = self.manifold.add_time(out)
@@ -165,6 +172,69 @@ class LorentzMultiHeadAttention(nn.Module):
             # mode from generic Q-K close-pair masking.
             self._z_origin_count = 0
 
+            # Sigma^2 per-image accumulators (per-epoch sum + image count).
+            # Reset by train.py at the start of each epoch's train and val passes.
+            self._sigma2_train_pre_sum   = 0.0
+            self._sigma2_train_pre_count = 0
+            self._sigma2_val_pre_sum     = 0.0
+            self._sigma2_val_pre_count   = 0
+            self._sigma2_train_post_sum  = 0.0
+            self._sigma2_train_post_count = 0
+            self._sigma2_val_post_sum    = 0.0
+            self._sigma2_val_post_count  = 0
+            # Post-attention all-tokens cache (set by encoder forward, detached).
+            self._last_post_attn_all_tokens = None
+            # K cached at construction so the σ² helper does not require a closure.
+            self._K_cache = abs(float(manifold.k.item())) if hasattr(manifold, 'k') else 1.0
+            self._sqrt_K_cache = self._K_cache ** 0.5
+
+    def _accumulate_sigma2(self, tokens, where: str):
+        """Push per-image c_tilde variance into the appropriate accumulator.
+        tokens: [B, n, hidden_dim+1] Lorentz points.
+        where:  one of 'train_pre', 'train_post', 'val_pre', 'val_post'.
+        Detached, no gradient impact."""
+        with torch.no_grad():
+            time = tokens[..., 0]
+            arg = (time / self._sqrt_K_cache).clamp_min(1.0 + 1e-3)
+            c_tilde = torch.acosh(arg)
+            sigma2_pi = c_tilde.var(dim=-1, unbiased=False)   # [B]
+            s = sigma2_pi.sum().item()
+            n = sigma2_pi.numel()
+            if where == 'train_pre':
+                self._sigma2_train_pre_sum   += s
+                self._sigma2_train_pre_count += n
+            elif where == 'train_post':
+                self._sigma2_train_post_sum   += s
+                self._sigma2_train_post_count += n
+            elif where == 'val_pre':
+                self._sigma2_val_pre_sum   += s
+                self._sigma2_val_pre_count += n
+            elif where == 'val_post':
+                self._sigma2_val_post_sum   += s
+                self._sigma2_val_post_count += n
+
+    def reset_sigma2_train(self):
+        self._sigma2_train_pre_sum   = 0.0
+        self._sigma2_train_pre_count = 0
+        self._sigma2_train_post_sum   = 0.0
+        self._sigma2_train_post_count = 0
+
+    def reset_sigma2_val(self):
+        self._sigma2_val_pre_sum   = 0.0
+        self._sigma2_val_pre_count = 0
+        self._sigma2_val_post_sum   = 0.0
+        self._sigma2_val_post_count = 0
+
+    def get_sigma2_train(self):
+        pre  = (self._sigma2_train_pre_sum  / self._sigma2_train_pre_count)  if self._sigma2_train_pre_count  > 0 else 0.0
+        post = (self._sigma2_train_post_sum / self._sigma2_train_post_count) if self._sigma2_train_post_count > 0 else 0.0
+        return pre, post
+
+    def get_sigma2_val(self):
+        pre  = (self._sigma2_val_pre_sum  / self._sigma2_val_pre_count)  if self._sigma2_val_pre_count  > 0 else 0.0
+        post = (self._sigma2_val_post_sum / self._sigma2_val_post_count) if self._sigma2_val_post_count > 0 else 0.0
+        return pre, post
+
     def lorentz_expmap_aggregation(self, v, score):
         v_tangent = self.manifold.logmap0(v)
         weighted_v_tangent = torch.matmul(score, v_tangent)
@@ -180,6 +250,8 @@ class LorentzMultiHeadAttention(nn.Module):
             # P5: full pre-attention token tensor — gradient-preserving
             # reference used by L_betacap to derive the geometric envelope.
             self._last_all_tokens_lorentz = x
+            # PRE-MHA σ² accumulation (input tokens — what L_radvar supervises).
+            self._accumulate_sigma2(x, 'train_pre' if self.training else 'val_pre')
 
         q = self.q(x)
         k = self.k(x)

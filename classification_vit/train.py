@@ -32,6 +32,15 @@ from haa_auxiliary_loss import build_aux_losses
 
 os.environ['WANDB_DIR'] = '/media/hdd/usr/forner/wandb/'
 
+DEEP_EPOCHS = frozenset({1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90})
+
+
+def _haa_mhas_iter(model):
+    base = model.module if hasattr(model, 'module') else model
+    for blk in base.encoder:
+        if hasattr(blk, 'mha') and getattr(blk.mha, 'use_haa', False):
+            yield blk.mha
+
 
 def getArguments():
     """ Parses command-line options. """
@@ -313,7 +322,7 @@ def main(args):
             _K = _base_m.enc_manifold.k.item()
             _cuda_rng = torch.cuda.get_rng_state_all()
             _cpu_rng  = torch.get_rng_state()
-            log_haa_deep_diagnostics(model, val_loader, device, start_epoch, _K, writer)
+            _ = log_haa_deep_diagnostics(model, val_loader, device, start_epoch, _K, writer)
             torch.cuda.set_rng_state_all(_cuda_rng)
             torch.set_rng_state(_cpu_rng)
         writer.close()
@@ -363,12 +372,38 @@ def main(args):
         'alpha_grad_norm':  [],
     }
 
+    # Build dynamic σ² and deep-diagnostic CSV column names per HAA layer.
+    sigma2_col_names = []
+    deep_col_names   = []
+    if any(getattr(blk.mha, 'use_haa', False)
+           for blk in (model.module if hasattr(model,'module') else model).encoder
+           if hasattr(blk, 'mha')):
+        for _mha in _haa_mhas_iter(model):
+            l = _mha.layer_idx
+            sigma2_col_names += [
+                f"train_sigma2_pre_attn_layer{l}",
+                f"train_sigma2_post_attn_layer{l}",
+                f"val_sigma2_pre_attn_layer{l}",
+                f"val_sigma2_post_attn_layer{l}",
+            ]
+            if args.deep_diagnostics:
+                for stat in ('sigma2_c_tilde', 'z_mean_diag', 'kl_z',
+                             'spatial_cv', 'attention_entropy'):
+                    deep_col_names.append(f"deep_layer{l}_{stat}")
+    # Per-epoch storage for σ² readings and deep diagnostics.
+    _sigma2_epoch_data = []        # list[dict] indexed by epoch offset
+    _deep_metrics_epoch_data = []  # list[dict] indexed by epoch offset
+
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
 
         losses = AverageMeter("Loss", ":.4e")
         acc1 = AverageMeter("Acc@1", ":6.2f")
         acc5 = AverageMeter("Acc@5", ":6.2f")
+
+        # Reset per-epoch σ² accumulators on every HAA MHA before the train pass.
+        for _mha in _haa_mhas_iter(model):
+            _mha.reset_sigma2_train()
 
         for i, (x, y) in tqdm(enumerate(train_loader)):
             # ------- Start iteration -------
@@ -467,6 +502,9 @@ def main(args):
         train_acc5s.append(acc5.avg)
 
         # ------- Start validation and logging -------
+        # Reset per-epoch σ² accumulators on every HAA MHA before the val pass.
+        for _mha in _haa_mhas_iter(model):
+            _mha.reset_sigma2_val()
         with torch.no_grad():
             loss_val, acc1_val, acc5_val = evaluate(model, val_loader, criterion, device)
 
@@ -481,6 +519,28 @@ def main(args):
 
             # Log per-layer HAA telemetry (reads values stored during evaluate())
             log_haa_epoch_metrics(model, epoch, writer)
+
+            # Read per-layer σ² accumulators (per-image variance of c̃ across
+            # the n=65 tokens of one image; mean over images in the pass).
+            sigma2_readings = {}
+            for _mha in _haa_mhas_iter(model):
+                _train_pre, _train_post = _mha.get_sigma2_train()
+                _val_pre,   _val_post   = _mha.get_sigma2_val()
+                sigma2_readings[f"train_sigma2_pre_attn_layer{_mha.layer_idx}"]  = _train_pre
+                sigma2_readings[f"train_sigma2_post_attn_layer{_mha.layer_idx}"] = _train_post
+                sigma2_readings[f"val_sigma2_pre_attn_layer{_mha.layer_idx}"]    = _val_pre
+                sigma2_readings[f"val_sigma2_post_attn_layer{_mha.layer_idx}"]   = _val_post
+
+            for _key, _val in sigma2_readings.items():
+                if writer is not None:
+                    writer.add_scalar(f"sigma2/{_key}", _val, epoch)
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log({f"sigma2/{_key}": _val}, step=epoch)
+                except ImportError:
+                    pass
+            _sigma2_epoch_data.append(sigma2_readings)
 
             # Collect HAA scalars from the last HAA layer for CSV
             if _haa_layers:
@@ -527,15 +587,19 @@ def main(args):
                         'args': args,
                     }, save_path)
 
-        # Deep diagnostics at epochs 1, 5, 10, 20, and the final epoch
-        if args.deep_diagnostics and ((epoch+1) in {1,5,10,20}
+        # Deep diagnostics at epochs in DEEP_EPOCHS {1,5,10,20,30,40,50,60,70,80,90}
+        # plus the final epoch.
+        if args.deep_diagnostics and ((epoch+1) in DEEP_EPOCHS
                                        or (epoch+1) == args.num_epochs):
             _K = model.module.enc_manifold.k.item()
             _cuda_rng = torch.cuda.get_rng_state_all()
             _cpu_rng  = torch.get_rng_state()
-            log_haa_deep_diagnostics(model, val_loader, device, epoch, _K, writer)
+            deep_metrics_this_epoch = log_haa_deep_diagnostics(model, val_loader, device, epoch, _K, writer) or {}
             torch.cuda.set_rng_state_all(_cuda_rng)
             torch.set_rng_state(_cpu_rng)
+        else:
+            deep_metrics_this_epoch = {}
+        _deep_metrics_epoch_data.append(deep_metrics_this_epoch)
         # ------- End validation and logging -------
 
     print("-----------------\nTraining finished\n-----------------")
@@ -556,19 +620,17 @@ def main(args):
         metrics_file = os.path.join(args.output_dir, f"{_run_exp_name}_metrics.csv")
         with open(metrics_file, mode='w', newline='') as file:
             writer_csv = csv.writer(file)
-            writer_csv.writerow([
-                "Epoch",
-                "Train Loss", "Val Loss",
-                "Train Acc@1", "Val Acc@1",
-                "Train Acc@5", "Val Acc@5",
-                "haa_beta", "haa_tau", "haa_lambda",
-                "haa_cone_sparsity", "haa_z_mean",
-                "haa_frac_near_origin",
-                "haa_grad_norm_B", "haa_grad_norm_c_tilde",
-                "cls_alpha_mean", "cls_alpha_grad_norm",
-            ])
+            base_header = [
+                'Epoch', 'Train Loss', 'Val Loss', 'Train Acc@1', 'Val Acc@1',
+                'Train Acc@5', 'Val Acc@5', 'haa_beta', 'haa_tau', 'haa_lambda',
+                'haa_cone_sparsity', 'haa_z_mean', 'haa_frac_near_origin',
+                'haa_grad_norm_B', 'haa_grad_norm_c_tilde',
+                'cls_alpha_mean', 'cls_alpha_grad_norm',
+            ]
+            full_header = base_header + sigma2_col_names + deep_col_names
+            writer_csv.writerow(full_header)
             for i in range(args.num_epochs):
-                writer_csv.writerow([
+                base_row = [
                     i+1,
                     train_losses[i], val_losses[i],
                     train_acc1s[i], val_acc1s[i],
@@ -583,7 +645,12 @@ def main(args):
                     _haa_epoch_data['grad_norm_c_tilde'][i] if i < len(_haa_epoch_data['grad_norm_c_tilde']) else '',
                     _haa_epoch_data['alpha_mean'][i]      if i < len(_haa_epoch_data['alpha_mean']) else '',
                     _haa_epoch_data['alpha_grad_norm'][i] if i < len(_haa_epoch_data['alpha_grad_norm']) else '',
-                ])
+                ]
+                _sigma2_i = _sigma2_epoch_data[i] if i < len(_sigma2_epoch_data) else {}
+                _deep_i   = _deep_metrics_epoch_data[i] if i < len(_deep_metrics_epoch_data) else {}
+                sigma2_row = [_sigma2_i.get(name, '') for name in sigma2_col_names]
+                deep_row   = [_deep_i.get(name, '')   for name in deep_col_names]
+                writer_csv.writerow(base_row + sigma2_row + deep_row)
         print(f"Metrics saved to {metrics_file}")
 
         # Save best accuracy and epoch to a text file

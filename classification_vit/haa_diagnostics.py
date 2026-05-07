@@ -307,6 +307,7 @@ def log_haa_deep_diagnostics(model, val_loader, device: str,
 
     was_training = model.training
     model.eval()
+    deep_metrics = {}
     try:
         with torch.no_grad():
             for x, _ in val_loader:
@@ -330,8 +331,16 @@ def log_haa_deep_diagnostics(model, val_loader, device: str,
             log_fn(f"deep/layer_{layer_idx}/kl_z",              kl_z)
             log_fn(f"deep/layer_{layer_idx}/spatial_cv",        spatial_cv)
             log_fn(f"deep/layer_{layer_idx}/attention_entropy", attn_ent)
+
+            deep_metrics[f"deep_layer{layer_idx}_sigma2_c_tilde"]    = sigma2_c
+            deep_metrics[f"deep_layer{layer_idx}_z_mean_diag"]       = z_mean
+            deep_metrics[f"deep_layer{layer_idx}_kl_z"]              = kl_z
+            deep_metrics[f"deep_layer{layer_idx}_spatial_cv"]        = spatial_cv
+            deep_metrics[f"deep_layer{layer_idx}_attention_entropy"] = attn_ent
     finally:
         for h in handles:
             h.remove()
-        if was_training:  
-            model.train() 
+        if was_training:
+            model.train()
+
+    return deep_metrics

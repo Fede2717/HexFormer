@@ -1,17 +1,18 @@
 """CLS-only radial scaling residual (Stage 2.1 Path B revised).
 
-Predicts a per-CLS scalar alpha in [0.2, ∞) via a 2-layer MLP:
-    alpha = 0.2 + softplus(MLP(cls_spatial))      # FIX-ALPHA-SOFTPLUS
-Range [0.2, ∞) with a smooth floor at 0.2. d(softplus)/d(raw) = sigmoid(raw)
-never saturates, so the optimizer can find any alpha ≥ 0.2 freely (the prior
-1 + 0.8*tanh form saturated to its [0.2, 1.8] bounds and zeroed gradients).
+Predicts a per-CLS scalar alpha in (0.1, 1.5) via a 2-layer MLP:
+    alpha = 0.1 + 1.4 * sigmoid(MLP(cls_spatial))   # FIX-ALPHA-SIGMOID
+Range (0.1, 1.5) — bounded sigmoid eliminates the unbounded softplus tail
+that produced an α=80 excursion in the post-Step-8 v3.1 analysis. The
+sigmoid is centred so its sensitivity peaks near α=0.8, the regime the
+optimizer should explore.
 
 Scales cls_spatial by alpha, then re-projects onto the Lorentz hyperboloid
 via manifold.add_time. Manifold constraint preserved exactly: <x_new, x_new>_L = -K.
 
-Init: MLP final layer weight=0; bias = softplus_inv(0.8) = log(exp(0.8) - 1)
-≈ 0.2036, giving alpha = 0.2 + softplus(0.2036) = 0.2 + 0.8 = 1.0 at every
-CLS.   # FIX-ALPHA-INIT
+Init: MLP final layer weight=0; bias = logit(0.6) = log(0.6 / 0.4) ≈ 0.405,
+giving alpha = 0.1 + 1.4 * sigmoid(0.405) = 0.1 + 1.4 * 0.6 = 1.0 at every
+CLS at init.   # FIX-ALPHA-SIGMOID
 
 Telemetry exposed:
     self._last_alpha       - per-CLS alpha values [B] (float, eval-only detached snapshot)
@@ -36,13 +37,11 @@ class CLSDepthResidual(nn.Module):
             nn.GELU(),
             nn.Linear(mlp_hidden, 1),
         )
-        # FIX-ALPHA-INIT: with softplus, softplus(0) = ln(2) ≈ 0.693, so
-        # zeroing the bias would give alpha_init = 0.2 + 0.693 ≈ 0.893, not
-        # 1.0. Set bias = softplus_inv(0.8) = log(exp(0.8) - 1) ≈ 0.2036 so
-        # that alpha = 0.2 + softplus(0.2036) = 1.0 at every CLS at init.
+        # FIX-ALPHA-SIGMOID: with alpha = 0.1 + 1.4 * sigmoid(raw), bias =
+        # logit(0.6) = log(0.6 / 0.4) ≈ 0.405 gives alpha = 0.1 + 1.4 * 0.6
+        # = 1.0 at every CLS at init.
         nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.constant_(self.mlp[-1].bias,
-                          math.log(math.exp(0.8) - 1.0))
+        nn.init.constant_(self.mlp[-1].bias, math.log(0.6 / 0.4))   # ≈ 0.405; gives α=1.0 at init
         # Hidden layer: small random init.
         nn.init.normal_(self.mlp[0].weight, std=0.01)
         nn.init.zeros_(self.mlp[0].bias)
@@ -56,8 +55,9 @@ class CLSDepthResidual(nn.Module):
         Returns [B, hidden_dim+1] Lorentz point on the manifold."""
         cls_spatial = cls_lorentz[..., 1:]                # [B, spatial_dim]
         raw = self.mlp(cls_spatial).squeeze(-1)           # [B]
-        # FIX-ALPHA-SOFTPLUS: smooth floor at 0.2, no upper saturation.
-        alpha = 0.2 + F.softplus(raw)                     # [B] in [0.2, ∞)
+        # FIX-ALPHA-SIGMOID: bounded range (0.1, 1.5) eliminates the
+        # unbounded softplus tail that produced an α=80 excursion.
+        alpha = 0.1 + 1.4 * torch.sigmoid(raw)            # [B] in (0.1, 1.5)
 
         # Eval-time snapshot of alpha for telemetry. During training we
         # also capture the value (overwritten every step) AND register a

@@ -180,8 +180,8 @@ class DirectionalAngularLoss(nn.Module):
     the masking rate is high.
     """
     def __init__(self,
-                 s_lo: float = 0.40,
-                 s_hi: float = 0.70,
+                 s_lo: float = 0.55,
+                 s_hi: float = 0.85,
                  kappa: float = 4.0,
                  m_smooth: float = 0.05,
                  warmup: int = 15,
