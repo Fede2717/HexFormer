@@ -36,10 +36,17 @@ DEEP_EPOCHS = frozenset({1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90})
 
 
 def _haa_mhas_iter(model):
+    # Walk submodules (instead of iterating base.encoder directly) because
+    # base = ViTClassifier exposes `.encoder` as the inner ViT module — an
+    # nn.Module without __iter__. The Sequential of blocks lives one level
+    # deeper. named_modules() reaches them regardless of wrapping depth.
+    from lib.lorentz.blocks.transformer_blocks import LorentzMultiHeadAttention
     base = model.module if hasattr(model, 'module') else model
-    for blk in base.encoder:
-        if hasattr(blk, 'mha') and getattr(blk.mha, 'use_haa', False):
-            yield blk.mha
+    mhas = [m for _, m in base.named_modules()
+            if isinstance(m, LorentzMultiHeadAttention) and getattr(m, 'use_haa', False)]
+    mhas.sort(key=lambda m: m.layer_idx)
+    for m in mhas:
+        yield m
 
 
 def getArguments():
@@ -375,9 +382,7 @@ def main(args):
     # Build dynamic σ² and deep-diagnostic CSV column names per HAA layer.
     sigma2_col_names = []
     deep_col_names   = []
-    if any(getattr(blk.mha, 'use_haa', False)
-           for blk in (model.module if hasattr(model,'module') else model).encoder
-           if hasattr(blk, 'mha')):
+    if any(True for _ in _haa_mhas_iter(model)):
         for _mha in _haa_mhas_iter(model):
             l = _mha.layer_idx
             sigma2_col_names += [
