@@ -193,11 +193,24 @@ def getArguments():
     parser.add_argument('--d_f_low', type=float, default=0.5)
     parser.add_argument('--d_f_high', type=float, default=1.85)
 
+    parser.add_argument('--phi_occ_max', type=float, default=0.0,
+        help="Max plateau weight for ConeOccupancyLoss (β-detach guarded). 0 disables.")
+    parser.add_argument('--phi_occ_warmup', type=int, default=15)
+    parser.add_argument('--occ_s_target', type=float, default=0.10,
+        help="Target soft cone-occupation fraction for ConeOccupancyLoss.")
+    parser.add_argument('--occ_kappa', type=float, default=6.0)
+    parser.add_argument('--occ_m_smooth', type=float, default=0.05)
+
     parser.add_argument('--use_cls_depth_residual', action='store_true',
         help="Stage 2.1 Path B: enable per-CLS radial scaling residual "
-             "alpha = 1 + 0.8*tanh(MLP(cls_spatial)) before the classifier. "
+             "alpha = 0.1 + 1.4*sigmoid(MLP(cls_spatial)) before the classifier. "
              "Decouples CLS depth from spatial norm so L_proto / L_radvar "
              "operate on an actual depth degree of freedom.")
+
+    parser.add_argument('--use_proto_softmax', action='store_true',
+        help="Replace LorentzMLR with LorentzPrototypeClassifier (Design 2).")
+    parser.add_argument('--proto_T_init', type=float, default=1.0,
+        help="Initial temperature for prototype-softmax classifier (positive).")
 
     args = parser.parse_args()
 
@@ -378,6 +391,15 @@ def main(args):
         'alpha_mean':       [],
         'alpha_grad_norm':  [],
     }
+    _haa_epoch_data.update({
+        'beta_first':             [],
+        'tau_first':              [],
+        'lambda_first':           [],
+        'cone_sparsity_first':    [],
+        'z_mean_first':           [],
+        'frac_near_origin_first': [],
+    })
+    _haa_epoch_data['proto_T'] = []
 
     # Build dynamic σ² and deep-diagnostic CSV column names per HAA layer.
     sigma2_col_names = []
@@ -525,6 +547,17 @@ def main(args):
             # Log per-layer HAA telemetry (reads values stored during evaluate())
             log_haa_epoch_metrics(model, epoch, writer)
 
+            # Phase 2: prototype-softmax temperature telemetry.
+            _decoder = (model.module.decoder if hasattr(model, 'module')
+                        else model.decoder)
+            from classification_vit.lorentz_proto_classifier import LorentzPrototypeClassifier
+            if isinstance(_decoder, LorentzPrototypeClassifier):
+                _T = _decoder.temperature.detach().item()
+                writer.add_scalar('proto_softmax/temperature', _T, epoch)
+                _haa_epoch_data['proto_T'].append(_T)
+            else:
+                _haa_epoch_data['proto_T'].append('')
+
             # Read per-layer σ² accumulators (per-image variance of c̃ across
             # the n=65 tokens of one image; mean over images in the pass).
             sigma2_readings = {}
@@ -558,6 +591,15 @@ def main(args):
                 _haa_epoch_data['frac_near_origin'].append(_last_mha.haa_frac_near_origin)
                 _haa_epoch_data['grad_norm_B'].append(_last_mha._grad_norms.get('B', ''))
                 _haa_epoch_data['grad_norm_c_tilde'].append(_last_mha._grad_norms.get('c_tilde', ''))
+
+            if _haa_layers:
+                _, _first_mha = _haa_layers[0]
+                _haa_epoch_data['beta_first'].append(_first_mha.haa_alpha)
+                _haa_epoch_data['tau_first'].append(_first_mha.haa_tau)
+                _haa_epoch_data['lambda_first'].append(_first_mha.haa_lambda)
+                _haa_epoch_data['cone_sparsity_first'].append(_first_mha.haa_cone_sparsity)
+                _haa_epoch_data['z_mean_first'].append(_first_mha.haa_mean_Z)
+                _haa_epoch_data['frac_near_origin_first'].append(_first_mha.haa_frac_near_origin)
 
             # Stage 2.1 Path B: per-CLS radial scaling residual telemetry.
             _cls_resid = getattr(_base, 'cls_depth_residual', None)
@@ -632,6 +674,12 @@ def main(args):
                 'haa_grad_norm_B', 'haa_grad_norm_c_tilde',
                 'cls_alpha_mean', 'cls_alpha_grad_norm',
             ]
+            base_header += [
+                'haa_beta_first', 'haa_tau_first', 'haa_lambda_first',
+                'haa_cone_sparsity_first', 'haa_z_mean_first',
+                'haa_frac_near_origin_first',
+            ]
+            base_header += ['proto_T']
             full_header = base_header + sigma2_col_names + deep_col_names
             writer_csv.writerow(full_header)
             for i in range(args.num_epochs):
@@ -650,6 +698,13 @@ def main(args):
                     _haa_epoch_data['grad_norm_c_tilde'][i] if i < len(_haa_epoch_data['grad_norm_c_tilde']) else '',
                     _haa_epoch_data['alpha_mean'][i]      if i < len(_haa_epoch_data['alpha_mean']) else '',
                     _haa_epoch_data['alpha_grad_norm'][i] if i < len(_haa_epoch_data['alpha_grad_norm']) else '',
+                    _haa_epoch_data['beta_first'][i]             if i < len(_haa_epoch_data['beta_first']) else '',
+                    _haa_epoch_data['tau_first'][i]              if i < len(_haa_epoch_data['tau_first']) else '',
+                    _haa_epoch_data['lambda_first'][i]           if i < len(_haa_epoch_data['lambda_first']) else '',
+                    _haa_epoch_data['cone_sparsity_first'][i]    if i < len(_haa_epoch_data['cone_sparsity_first']) else '',
+                    _haa_epoch_data['z_mean_first'][i]           if i < len(_haa_epoch_data['z_mean_first']) else '',
+                    _haa_epoch_data['frac_near_origin_first'][i] if i < len(_haa_epoch_data['frac_near_origin_first']) else '',
+                    _haa_epoch_data['proto_T'][i] if i < len(_haa_epoch_data['proto_T']) else '',
                 ]
                 _sigma2_i = _sigma2_epoch_data[i] if i < len(_sigma2_epoch_data) else {}
                 _deep_i   = _deep_metrics_epoch_data[i] if i < len(_deep_metrics_epoch_data) else {}

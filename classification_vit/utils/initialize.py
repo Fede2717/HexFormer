@@ -107,12 +107,18 @@ def select_model(img_dim, num_classes, args):
         enc_args['k'] = args.encoder_k
 
     dec_args = {
-        'embed_dim' : args.hidden_dim,
-        'num_classes' : num_classes,
-        'k' : args.decoder_k,
-        'learn_k' : args.learn_k,
-        'type' : 'mlr',
-        'clip_r' : args.clip_features
+        'embed_dim'       : args.hidden_dim,
+        'num_classes'     : num_classes,
+        'k'               : args.decoder_k,
+        'learn_k'         : args.learn_k,
+        'type'            : 'mlr',
+        'clip_r'          : args.clip_features,
+        'use_proto_softmax': bool(getattr(args, 'use_proto_softmax', False)),
+        'proto_seed'      : int(getattr(args, 'proto_seed', 42)),
+        'd_s'             : float(getattr(args, 'd_s', 0.3)),
+        'd_f_low'         : float(getattr(args, 'd_f_low', 0.5)),
+        'd_f_high'        : float(getattr(args, 'd_f_high', 1.85)),
+        'T_init'          : float(getattr(args, 'proto_T_init', 1.0)),
     }
 
     model = ViTClassifier(

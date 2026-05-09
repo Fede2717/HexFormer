@@ -13,6 +13,8 @@ from lib.models.ViT import (
     lorentz_vit
 )
 
+from classification_vit.lorentz_proto_classifier import LorentzPrototypeClassifier
+
 VIT_MODEL = {
     "euclidean" : vit,
     "lorentz" : lorentz_vit,
@@ -55,7 +57,22 @@ class ViTClassifier(nn.Module):
             self.decoder = EUCLIDEAN_DECODER[dec_kwargs['type']](dec_kwargs['embed_dim'], dec_kwargs['num_classes'])
         elif dec_type == "lorentz":
             self.dec_manifold = CustomLorentz(k=dec_kwargs["k"], learnable=dec_kwargs['learn_k'])
-            self.decoder = LORENTZ_DECODER[dec_kwargs['type']](self.dec_manifold, dec_kwargs['embed_dim'], dec_kwargs['num_classes'])
+            if dec_kwargs.get('use_proto_softmax', False):
+                self.decoder = LorentzPrototypeClassifier(
+                    manifold=self.dec_manifold,
+                    hidden_dim_lorentz=dec_kwargs['embed_dim'] + 1,
+                    num_classes=dec_kwargs['num_classes'],
+                    K=float(dec_kwargs['k']),
+                    proto_seed=int(dec_kwargs.get('proto_seed', 42)),
+                    d_s=float(dec_kwargs.get('d_s', 0.3)),
+                    d_f_low=float(dec_kwargs.get('d_f_low', 0.5)),
+                    d_f_high=float(dec_kwargs.get('d_f_high', 1.85)),
+                    T_init=float(dec_kwargs.get('T_init', 1.0)),
+                )
+            else:
+                # PHASE2: legacy LorentzMLR decoder; preserved for ablation comparisons.
+                self.decoder = LORENTZ_DECODER[dec_kwargs['type']](
+                    self.dec_manifold, dec_kwargs['embed_dim'], dec_kwargs['num_classes'])
         elif dec_type == "poincare":
             self.dec_manifold = CustomPoincare(c=dec_kwargs["k"], learnable=dec_kwargs['learn_k'])
             self.decoder = POINCARE_DECODER[dec_kwargs['type']](dec_kwargs['embed_dim'], dec_kwargs['num_classes'], True, self.dec_manifold)

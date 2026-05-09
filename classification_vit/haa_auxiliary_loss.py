@@ -117,7 +117,7 @@ def _get_last_haa_mha(model):
     for _, m in base.named_modules():
         if getattr(m, 'use_haa', False):
             idx = getattr(m, 'layer_idx', -1)
-            if idx >= last_idx:
+            if idx > last_idx:
                 last_mha = m
                 last_idx = idx
     return last_mha
@@ -212,6 +212,51 @@ class DirectionalAngularLoss(nn.Module):
         loss_lo = F.relu(self.s_lo - s_cone).pow(2)
         loss_hi = F.relu(s_cone - self.s_hi).pow(2)
         return loss_lo + loss_hi
+
+
+# ---------------------------------------------------------------------------
+# Cone Occupancy Loss (Phase 2) — β-detach guarded
+# ---------------------------------------------------------------------------
+class ConeOccupancyLoss(nn.Module):
+    """Soft cone-occupation loss with mathematically correct β-collapse guard.
+
+    cone_score = -(B_det + Z) - m_smooth, with B_det = B.detach(). The
+    aperture B is held detached so the optimizer cannot satisfy the
+    occupation target by inflating β — gradient must flow through Z only.
+    The loss is a one-sided hinge on the soft-occupation fraction, pulling
+    it up to s_target.
+    """
+    def __init__(self,
+                 s_target: float = 0.10,
+                 kappa: float = 6.0,
+                 m_smooth: float = 0.05,
+                 warmup: int = 15,
+                 ramp: int = 25,
+                 plateau: float = 0.5):
+        super().__init__()
+        self.s_target = s_target
+        self.kappa = kappa
+        self.m_smooth = m_smooth
+        self.schedule = RampSchedule(warmup, ramp, plateau)
+
+    def forward(self, model, x, y, device):
+        mha = _get_last_haa_mha(model)
+        if mha is None or getattr(mha, '_last_Z', None) is None \
+                       or getattr(mha, '_last_B', None) is None \
+                       or getattr(mha, '_last_valid_mask', None) is None:
+            return torch.zeros((), device=device)
+        Z = mha._last_Z                             # gradient-attached
+        B_det = mha._last_B.detach()                # β-collapse guard
+        assert not B_det.requires_grad, "B_det must be detached (β-collapse guard)"
+        valid = mha._last_valid_mask
+        if not valid.any():
+            return torch.zeros((), device=device)
+        cone_score = -(B_det + Z) - self.m_smooth
+        sig = torch.sigmoid(self.kappa * cone_score)
+        valid_f = valid.float()
+        n_valid = valid_f.sum().clamp_min(1.0)
+        s_cone = (sig * valid_f).sum() / n_valid
+        return F.relu(self.s_target - s_cone).pow(2)
 
 
 # ---------------------------------------------------------------------------
@@ -523,8 +568,8 @@ def build_aux_losses(args):
     (its corresponding *_max weight is 0). The training loop iterates the
     dict and skips None entries.
     """
-    out = {'angular': None, 'hhl': None,
-           'proto': None, 'radvar': None, 'betacap': None}
+    out = {'angular': None, 'hhl': None, 'proto': None,
+           'radvar': None, 'betacap': None, 'occ': None}
 
     gamma_max = float(getattr(args, 'gamma_angular_max', 0.0))
     if gamma_max > 0:
@@ -546,20 +591,28 @@ def build_aux_losses(args):
 
     eta_proto_max = float(getattr(args, 'eta_proto_max', 0.0))
     if eta_proto_max > 0:
-        K = float(getattr(args, 'encoder_k', 1.0))
-        prototypes = getattr(args, 'hyperbolic_prototypes', None)
-        if prototypes is None:
-            raise RuntimeError(
-                "L_proto enabled but args.hyperbolic_prototypes not set. "
-                "Build prototypes in the model setup before constructing aux losses.")
-        out['proto'] = HyperbolicPrototypeLoss(
-            K=K,
-            prototypes_lorentz=prototypes,
-            num_super=int(getattr(args, 'num_super', NUM_SUPER)),
-            warmup=int(getattr(args, 'eta_proto_warmup', 5)),
-            ramp=25,
-            plateau=eta_proto_max,
-        )
+        if bool(getattr(args, 'use_proto_softmax', False)):
+            # PHASE2: L_proto provides only attraction to p_y; prototype-softmax CE
+            # provides attraction PLUS logsumexp repulsion from non-targets. Running
+            # both double-counts the attraction component. L_proto is disabled here.
+            import warnings as _w
+            _w.warn("L_proto disabled because --use_proto_softmax is set "
+                    "(prototype-softmax CE supersedes L_proto).")
+        else:
+            K = float(getattr(args, 'encoder_k', 1.0))
+            prototypes = getattr(args, 'hyperbolic_prototypes', None)
+            if prototypes is None:
+                raise RuntimeError(
+                    "L_proto enabled but args.hyperbolic_prototypes not set. "
+                    "Build prototypes in the model setup before constructing aux losses.")
+            out['proto'] = HyperbolicPrototypeLoss(
+                K=K,
+                prototypes_lorentz=prototypes,
+                num_super=int(getattr(args, 'num_super', NUM_SUPER)),
+                warmup=int(getattr(args, 'eta_proto_warmup', 5)),
+                ramp=25,
+                plateau=eta_proto_max,
+            )
 
     zeta_radvar_max = float(getattr(args, 'zeta_radvar_max', 0.0))
     if zeta_radvar_max > 0:
@@ -583,6 +636,17 @@ def build_aux_losses(args):
             warmup=int(getattr(args, 'xi_betacap_warmup', 20)),
             ramp=20,
             plateau=xi_betacap_max,
+        )
+
+    phi_occ_max = float(getattr(args, 'phi_occ_max', 0.0))
+    if phi_occ_max > 0:
+        out['occ'] = ConeOccupancyLoss(
+            s_target=float(getattr(args, 'occ_s_target', 0.10)),
+            kappa=float(getattr(args, 'occ_kappa', 6.0)),
+            m_smooth=float(getattr(args, 'occ_m_smooth', 0.05)),
+            warmup=int(getattr(args, 'phi_occ_warmup', 15)),
+            ramp=25,
+            plateau=phi_occ_max,
         )
 
     return out
