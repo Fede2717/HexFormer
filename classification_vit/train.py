@@ -337,6 +337,14 @@ def main(args):
         print(f"[eval_only] Val: Loss={loss_val:.4f}, "
               f"Acc@1={acc1_val:.4f}, Acc@5={acc5_val:.4f}")
         log_haa_epoch_metrics(model, epoch=start_epoch, writer=writer)
+        # S-3: also log prototype-softmax temperature in eval_only.
+        _decoder = (model.module.decoder if hasattr(model, 'module')
+                    else model.decoder)
+        from classification_vit.lorentz_proto_classifier import LorentzPrototypeClassifier
+        if isinstance(_decoder, LorentzPrototypeClassifier):
+            _T = _decoder.temperature.detach().item()
+            writer.add_scalar('proto_softmax/temperature', _T, start_epoch)
+            print(f"[eval_only] proto_softmax temperature = {_T:.6f}")
         if args.deep_diagnostics:
             _base_m = model.module if hasattr(model, 'module') else model
             _K = _base_m.enc_manifold.k.item()

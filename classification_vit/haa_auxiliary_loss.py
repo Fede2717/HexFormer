@@ -443,7 +443,12 @@ class HyperbolicPrototypeLoss(nn.Module):
         u = (arg - 1.0).clamp_min(0.0)
         sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
         acosh_val = torch.log1p(u + sqrt_term)
-        return acosh_val.pow(2).mean()
+        # S-7b: full Lorentz geodesic distance squared d_L^2 = K * acosh^2(arg).
+        # K=1.0 in all past Phase-1 experiments (Step 8 v3.2 etc.), so this
+        # change is numerically identity for prior runs. The fix matches the
+        # K factor convention used by RadialVarianceLoss, BetaCapLoss, and the
+        # spatial-penalty path in transformer_blocks.py.
+        return (self.K * acosh_val.pow(2)).mean()
 
 
 # ---------------------------------------------------------------------------

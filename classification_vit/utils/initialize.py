@@ -144,27 +144,54 @@ def select_optimizer(model, len_train_loader, args):
     elif args.optimizer == "SGD":
         optimizer = torch.optim.SGD(model_parameters, lr=args.lr, weight_decay=args.weight_decay, momentum=0.9, nesterov=True)
     else:
-        raise "Optimizer not found. Wrong optimizer in configuration... -> " + args.model
+        raise RuntimeError(
+            "Optimizer not found. Wrong optimizer in configuration -> "
+            f"{args.optimizer}")
       
     lr_scheduler = build_scheduler(args, optimizer, len_train_loader)
 
     return optimizer, lr_scheduler
 
 def get_param_groups(model, lr_manifold, weight_decay_manifold):
-    no_decay = ["scale"]
+    # Historical exclusion list — matched parameters are removed from
+    # every group below. `scale` is non-trainable by default
+    # (requires_grad=False), so this is effectively a no-op for it,
+    # but the exclusion is kept for backward compatibility.
+    no_include = ["scale"]
+    # G-1: parameters that should be optimized but with no weight decay.
+    # The prototype-softmax temperature `log_T` (LorentzPrototypeClassifier)
+    # is a 1-D scalar driving softmax sharpness; weight decay would
+    # bias it toward softplus(0) ≈ 0.69 and confound the learned
+    # temperature curve.
+    no_wd_optimized = ["log_T"]
     k_params = [".k"]
 
     parameters = [
         {
+            # Default group: trainable, decay-eligible.
             "params": [
                 p
                 for n, p in model.named_parameters()
                 if p.requires_grad
-                and not any(nd in n for nd in no_decay)
+                and not any(nd in n for nd in no_include)
+                and not any(nw in n for nw in no_wd_optimized)
                 and not isinstance(p, ManifoldParameter)
                 and not any(nd in n for nd in k_params)
             ],
             "name": "1"
+        },
+        {
+            # G-1: trainable, weight_decay = 0.
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if p.requires_grad
+                and any(nw in n for nw in no_wd_optimized)
+                and not isinstance(p, ManifoldParameter)
+                and not any(nd in n for nd in k_params)
+            ],
+            "weight_decay": 0.0,
+            "name": "no_wd"
         },
         {
             "params": [
@@ -303,7 +330,8 @@ def select_dataset(args, validation_split=False):
         num_classes = 1000
 
     else:
-        raise "Selected dataset '{}' not available.".format(args.dataset)
+        raise RuntimeError(
+            f"Selected dataset '{args.dataset}' not available.")
     
     # Dataloader
     train_loader = DataLoader(train_set,
