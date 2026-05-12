@@ -93,6 +93,7 @@ def select_model(img_dim, num_classes, args):
     }
     enc_args['tau_init']    = getattr(args, 'haa_tau_init',    1.0)
     enc_args['lambda_init'] = getattr(args, 'haa_lambda_init', 1.0)
+    enc_args['learn_lambda'] = getattr(args, 'learn_lambda', True)
     # STEP 2 / CHANGE-2: aperture-gradient regime (relu = legacy, softplus = fixed)
     enc_args['B_smooth']        = getattr(args, 'B_smooth',        'softplus')
     enc_args['B_softplus_temp'] = getattr(args, 'B_softplus_temp', 4.0)

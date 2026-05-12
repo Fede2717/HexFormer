@@ -40,6 +40,7 @@ class ViT(nn.Module):
         beta_proportional=False,
         tau_init=1.0,
         lambda_init=1.0,
+        learn_lambda=True,
         beta_init_override=None,
         B_smooth='softplus',
         B_softplus_temp=4.0,
@@ -78,6 +79,7 @@ class ViT(nn.Module):
             if beta_init_override is not None:
                 _beta_init = beta_init_override
             layer = self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout, use_haa=use_haa, beta_init_val=_beta_init, tau_init=tau_init, lambda_init=lambda_init,
+                                                 learn_lambda=learn_lambda,
                                                  B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
             if hasattr(layer, 'mha'):
                 layer.mha.layer_idx = idx
@@ -168,12 +170,14 @@ class ViT(nn.Module):
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")
 
     def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False, beta_init_val=None, tau_init=1.0, lambda_init=1.0,
+                                learn_lambda=True,
                                 B_smooth='softplus', B_softplus_temp=4.0):
         if self.manifold is None:
             return TransformerEncoder(hidden_dim, mlp_dim, num_patches, heads, dropout)
 
         elif type(self.manifold) is CustomLorentz:
             return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init,
+                                              learn_lambda=learn_lambda,
                                               B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
 
         else:

@@ -12,6 +12,7 @@ sys.path.append(lib_path)
 
 import torch
 from torch.nn import DataParallel
+import argparse
 import configargparse
 from tqdm import tqdm
 import random
@@ -144,6 +145,11 @@ def getArguments():
              "Use 3.0 for terminal_aggressive.")
     parser.add_argument('--haa_lambda_init', default=1.0, type=float,
         help="Initial lambda value for HAA spatial weight. Default 1.0. Use 0.3 for terminal_aggressive.")
+    parser.add_argument('--learn_lambda', default=True,
+        action=argparse.BooleanOptionalAction,
+        help="If set, lambda_raw is a trainable nn.Parameter (default). "
+             "Pass --no-learn_lambda to freeze the spatial penalty parameter "
+             "at its init value (requires_grad=False) for ablation studies.")
     parser.add_argument('--deep_diagnostics', action='store_true',
         help="Run extra val pass at epochs {1,5,10,20,final} for geometric diagnostics. "
              "Disable for RNG-clean training runs.")

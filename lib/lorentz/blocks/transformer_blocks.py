@@ -40,7 +40,7 @@ class LorentzEmbedding(nn.Module):
 class LorentzTransformerEncoder(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout,
                  stochastic_depth=0.1, use_haa=False, beta_init_val=None,
-                 tau_init=1.0, lambda_init=1.0,
+                 tau_init=1.0, lambda_init=1.0, learn_lambda=True,
                  B_smooth='softplus', B_softplus_temp=4.0):
         super(LorentzTransformerEncoder, self).__init__()
 
@@ -54,6 +54,7 @@ class LorentzTransformerEncoder(nn.Module):
 
         self.ln1 = LorentzLayerNorm(manifold, hidden)
         self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init,
+                                             learn_lambda=learn_lambda,
                                              B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
         self.ln2 = LorentzLayerNorm(manifold, hidden)
         self.mlp = nn.Sequential(
@@ -95,7 +96,7 @@ class LorentzTransformerEncoder(nn.Module):
 class LorentzMultiHeadAttention(nn.Module):
     def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0,
                  learn_scale=False, use_haa=False, beta_init_val=None,
-                 tau_init=1.0, lambda_init=1.0,
+                 tau_init=1.0, lambda_init=1.0, learn_lambda=True,
                  B_smooth='softplus', B_softplus_temp=4.0):
         super(LorentzMultiHeadAttention, self).__init__()
         # CHANGE-2: aperture-gradient regime selector (relu = legacy, softplus = fixed)
@@ -141,6 +142,8 @@ class LorentzMultiHeadAttention(nn.Module):
             self.beta_raw   = nn.Parameter(torch.tensor([_beta_raw_init]))
             self.tau_raw    = nn.Parameter(torch.tensor([math.log(math.exp(tau_init) - 1.0)]))
             self.lambda_raw = nn.Parameter(torch.tensor([math.log(math.exp(lambda_init) - 1.0)]))
+            if not learn_lambda:
+                self.lambda_raw.requires_grad = False
 
             self.haa_alpha            = 0.0
             self.haa_tau              = 0.0
