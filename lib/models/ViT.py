@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 from lib.Euclidean.blocks.transformer_blocks import TransformerEncoder, Embedding
 
@@ -45,6 +46,7 @@ class ViT(nn.Module):
         B_smooth='softplus',
         B_softplus_temp=4.0,
         use_cls_depth_residual=False,
+        use_q_depth_mlp=False,
     ):
         super(ViT, self).__init__()
         self.manifold = manifold
@@ -80,7 +82,8 @@ class ViT(nn.Module):
                 _beta_init = beta_init_override
             layer = self._get_transformerEncoder(hidden_dim, mlp_dim, self.num_patches, heads, dropout, use_haa=use_haa, beta_init_val=_beta_init, tau_init=tau_init, lambda_init=lambda_init,
                                                  learn_lambda=learn_lambda,
-                                                 B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
+                                                 B_smooth=B_smooth, B_softplus_temp=B_softplus_temp,
+                                                 use_q_depth_mlp=use_q_depth_mlp)
             if hasattr(layer, 'mha'):
                 layer.mha.layer_idx = idx
                 layer.mha.max_layer_idx = max_haa_idx
@@ -128,6 +131,14 @@ class ViT(nn.Module):
 
         self.apply(init_weights)
 
+        for blk in self.encoder:
+            if hasattr(blk, 'mha') and getattr(blk.mha, 'use_q_depth_mlp', False):
+                qdm = blk.mha.q_depth_mlp
+                nn.init.zeros_(qdm[-1].weight)
+                nn.init.constant_(qdm[-1].bias, math.log(0.6 / 0.4))
+                nn.init.normal_(qdm[0].weight, std=0.01)
+                nn.init.zeros_(qdm[0].bias)
+
         # Re-zero the CLS depth residual MLP final layer AFTER apply(init_weights),
         # which would otherwise xavier-init it and break the alpha=1.0 init guarantee.
         # FIX-ALPHA-SIGMOID: under alpha = 0.1 + 1.4 * sigmoid(raw), bias must
@@ -171,14 +182,16 @@ class ViT(nn.Module):
 
     def _get_transformerEncoder(self, hidden_dim, mlp_dim, num_patches, heads, dropout, use_haa=False, beta_init_val=None, tau_init=1.0, lambda_init=1.0,
                                 learn_lambda=True,
-                                B_smooth='softplus', B_softplus_temp=4.0):
+                                B_smooth='softplus', B_softplus_temp=4.0,
+                                use_q_depth_mlp=False):
         if self.manifold is None:
             return TransformerEncoder(hidden_dim, mlp_dim, num_patches, heads, dropout)
 
         elif type(self.manifold) is CustomLorentz:
             return LorentzTransformerEncoder(self.manifold, hidden_dim+1, mlp_dim+1, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init,
                                               learn_lambda=learn_lambda,
-                                              B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
+                                              B_smooth=B_smooth, B_softplus_temp=B_softplus_temp,
+                                              use_q_depth_mlp=use_q_depth_mlp)
 
         else:
             raise RuntimeError(f"Manifold {type(self.manifold)} not supported in ViT.")

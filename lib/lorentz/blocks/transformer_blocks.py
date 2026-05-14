@@ -41,7 +41,8 @@ class LorentzTransformerEncoder(nn.Module):
     def __init__(self, manifold: CustomLorentz, hidden, mlp_hidden, num_patches, heads, dropout,
                  stochastic_depth=0.1, use_haa=False, beta_init_val=None,
                  tau_init=1.0, lambda_init=1.0, learn_lambda=True,
-                 B_smooth='softplus', B_softplus_temp=4.0):
+                 B_smooth='softplus', B_softplus_temp=4.0,
+                 use_q_depth_mlp=False):
         super(LorentzTransformerEncoder, self).__init__()
 
         self.manifold = manifold
@@ -55,7 +56,8 @@ class LorentzTransformerEncoder(nn.Module):
         self.ln1 = LorentzLayerNorm(manifold, hidden)
         self.mha = LorentzMultiHeadAttention(manifold, hidden, num_patches, heads, dropout, use_haa=use_haa, beta_init_val=beta_init_val, tau_init=tau_init, lambda_init=lambda_init,
                                              learn_lambda=learn_lambda,
-                                             B_smooth=B_smooth, B_softplus_temp=B_softplus_temp)
+                                             B_smooth=B_smooth, B_softplus_temp=B_softplus_temp,
+                                             use_q_depth_mlp=use_q_depth_mlp)
         self.ln2 = LorentzLayerNorm(manifold, hidden)
         self.mlp = nn.Sequential(
             LorentzFullyConnected(manifold, hidden, mlp_hidden, activation=nn.GELU(), dropout=dropout),
@@ -97,7 +99,8 @@ class LorentzMultiHeadAttention(nn.Module):
     def __init__(self, manifold: CustomLorentz, num_features, num_patches, heads, dropout=0.0,
                  learn_scale=False, use_haa=False, beta_init_val=None,
                  tau_init=1.0, lambda_init=1.0, learn_lambda=True,
-                 B_smooth='softplus', B_softplus_temp=4.0):
+                 B_smooth='softplus', B_softplus_temp=4.0,
+                 use_q_depth_mlp=False):
         super(LorentzMultiHeadAttention, self).__init__()
         # CHANGE-2: aperture-gradient regime selector (relu = legacy, softplus = fixed)
         self.B_smooth = B_smooth
@@ -191,6 +194,36 @@ class LorentzMultiHeadAttention(nn.Module):
             self._K_cache = abs(float(manifold.k.item())) if hasattr(manifold, 'k') else 1.0
             self._sqrt_K_cache = self._K_cache ** 0.5
 
+            import math as _math
+            # Per-head Q-CLS depth scaling MLP (Step 11). Operates on each head's
+            # spatial slice of the CLS Q vector and produces a per-head alpha_q in
+            # (0.1, 1.5) used to rescale CLS-Q spatial component before the score
+            # formula. alpha_q = 1.0 at init via bias = logit(0.6) = log(0.6/0.4).
+            self.use_q_depth_mlp = False  # toggled by an external flag at construction time
+            _spatial_per_head = (num_features - 1) // heads
+            self.q_depth_mlp = torch.nn.Sequential(
+                torch.nn.Linear(_spatial_per_head, 32),
+                torch.nn.GELU(),
+                torch.nn.Linear(32, 1),
+            )
+            torch.nn.init.zeros_(self.q_depth_mlp[-1].weight)
+            torch.nn.init.constant_(self.q_depth_mlp[-1].bias, _math.log(0.6 / 0.4))
+            torch.nn.init.normal_(self.q_depth_mlp[0].weight, std=0.01)
+            torch.nn.init.zeros_(self.q_depth_mlp[0].bias)
+            self._last_alpha_q = None       # [B, heads] float, detached
+            self._last_alpha_q_grad = 0.0
+
+            # NEW: post-W_Q full token tensor for L_radvar / L_spread supervision.
+            # Captured AFTER self.q(x) and AFTER any q_depth_mlp scaling so that the
+            # losses supervise the exact tensor the score formula reads.
+            self._last_q_post_wq = None     # [B, heads, n, head_dim+1]
+            self._last_k_post_wq = None     # [B, heads, n, head_dim+1]
+
+            self.use_q_depth_mlp = use_q_depth_mlp
+
+            assert num_features - 1 == heads * ((num_features - 1) // heads), \
+                f"head_dim*heads != num_features-1: {heads}*{(num_features-1)//heads} != {num_features-1}"
+
     def _accumulate_sigma2(self, tokens, where: str):
         """Push per-image c_tilde variance into the appropriate accumulator.
         tokens: [B, n, hidden_dim+1] Lorentz points.
@@ -257,10 +290,30 @@ class LorentzMultiHeadAttention(nn.Module):
             self._accumulate_sigma2(x, 'train_pre' if self.training else 'val_pre')
 
         q = self.q(x)
+        if self.use_haa and self.use_q_depth_mlp:
+            # q shape after self.q is [B, heads, n, head_dim+1] Lorentz.
+            # Operate on token 0 (CLS) only, per head, on the spatial slice.
+            _cls_q_space = q[:, :, 0:1, 1:]                                # [B, h, 1, head_dim]
+            _raw = self.q_depth_mlp(_cls_q_space.squeeze(2)).squeeze(-1)   # [B, h]
+            _alpha_q = 0.1 + 1.4 * torch.sigmoid(_raw)                     # [B, h] in (0.1, 1.5)
+            self._last_alpha_q = _alpha_q.detach()
+            if self.training and _alpha_q.requires_grad:
+                _alpha_q.register_hook(
+                    lambda g: setattr(self, '_last_alpha_q_grad',
+                                      g.detach().abs().mean().item()))
+            # Apply per-head scaling to CLS spatial; reproject onto Lorentz.
+            _cls_space_scaled = _alpha_q[:, :, None, None] * _cls_q_space   # [B, h, 1, head_dim]
+            _patches_space = q[:, :, 1:, 1:]                                 # [B, h, n-1, head_dim]
+            _q_space_full = torch.cat([_cls_space_scaled, _patches_space], dim=2)  # [B, h, n, head_dim]
+            q = self.manifold.add_time(_q_space_full)                        # back to [B, h, n, head_dim+1]
         k = self.k(x)
         v = self.v(x)
 
         if self.use_haa:
+            # Capture post-W_Q tensors for L_radvar / L_spread. Gradient-attached
+            # (no .detach()) — these tensors feed losses that must drive W_Q.
+            self._last_q_post_wq = q
+            self._last_k_post_wq = k
             q_time  = q.narrow(-1, 0, 1)
             k_time  = k.narrow(-1, 0, 1)
             q_space = q.narrow(-1, 1, q.shape[-1] - 1)

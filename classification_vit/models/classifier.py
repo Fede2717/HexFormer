@@ -65,9 +65,9 @@ class ViTClassifier(nn.Module):
                     K=float(dec_kwargs['k']),
                     proto_seed=int(dec_kwargs.get('proto_seed', 42)),
                     d_s=float(dec_kwargs.get('d_s', 0.3)),
-                    d_f_low=float(dec_kwargs.get('d_f_low', 0.5)),
-                    d_f_high=float(dec_kwargs.get('d_f_high', 1.85)),
+                    d_f_mid=float(dec_kwargs.get('d_f_mid', 1.175)),
                     T_init=float(dec_kwargs.get('T_init', 1.0)),
+                    dataset_name=str(dec_kwargs.get('dataset_name', 'CIFAR-100')),
                 )
             else:
                 # PHASE2: legacy LorentzMLR decoder; preserved for ablation comparisons.

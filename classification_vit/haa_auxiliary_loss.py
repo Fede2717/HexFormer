@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from cifar100_hierarchy import FINE_TO_SUPER, NUM_FINE, NUM_SUPER
+from hierarchy_loader import load_hierarchy
 
 
 # ---------------------------------------------------------------------------
@@ -35,14 +35,18 @@ def build_hyperbolic_prototypes(num_super: int,
                                 K: float = 1.0,
                                 seed: int = 42,
                                 d_s: float = 0.3,
-                                d_f_low: float = 0.5,
-                                d_f_high: float = 1.85) -> torch.Tensor:
+                                d_f_mid: float = 1.175) -> torch.Tensor:
     """Construct fixed Lorentz prototypes for L_proto.
 
     Returns a tensor of shape [num_super + num_fine, hidden_dim].
     Indices [0 : num_super] are super-prototypes (shallow, depth d_s).
     Indices [num_super : num_super + num_fine] are fine-prototypes
-    (deep, depth d_s + d_f[c], inside parent's tan(pi/8) angular cap).
+    (deep, depth d_s + d_f_mid, inside parent's tan(pi/8) angular cap).
+
+    Depths are DETERMINISTIC per level: every super sits exactly at
+    depth d_s, every fine sits exactly at depth d_s + d_f_mid. Sibling
+    fines therefore share identical Lorentz norms (the variance over
+    fine depths is zero).
 
     Super angular positions: closed-form simplex ETF. C = num_super vectors
     in spatial space with all pairwise cosines = -1/(C-1). Maximally and
@@ -87,10 +91,9 @@ def build_hyperbolic_prototypes(num_super: int,
         w = w / w.norm().clamp_min(1e-8)
         fine_angles[c] = w
 
-    # --- depths ---
-    super_depths = torch.full((num_super,), d_s)
-    d_f = torch.empty(num_fine).uniform_(d_f_low, d_f_high, generator=g)
-    fine_depths = d_s + d_f
+    # --- depths (deterministic per level) ---
+    super_depths = torch.full((num_super,), float(d_s))
+    fine_depths  = torch.full((num_fine,),  float(d_s) + float(d_f_mid))
 
     # --- assemble Lorentz points ---
     def assemble(angles, depths):
@@ -102,6 +105,8 @@ def build_hyperbolic_prototypes(num_super: int,
 
     super_protos = assemble(super_angles, super_depths)
     fine_protos = assemble(fine_angles, fine_depths)
+    assert torch.allclose(super_protos[..., 0], super_protos[0:1, 0].expand_as(super_protos[..., 0]), atol=1e-6), "super depth check failed"
+    assert torch.allclose(fine_protos[..., 0], fine_protos[0:1, 0].expand_as(fine_protos[..., 0]), atol=1e-6), "fine depth check failed"
     return torch.cat([super_protos, fine_protos], dim=0)
 
 
@@ -272,12 +277,16 @@ class HyperbolicHierarchyLoss(nn.Module):
     """
     def __init__(self,
                  K: float,
+                 dataset_name: str = 'CIFAR-100',
                  margin: float = 0.3,
                  ema: float = 0.9,
                  warmup: int = 5,
                  ramp: int = 25,
                  plateau: float = 0.5):
         super().__init__()
+        FINE_TO_SUPER, NUM_FINE, NUM_SUPER = load_hierarchy(dataset_name)
+        self.NUM_SUPER = NUM_SUPER
+        self.NUM_FINE = NUM_FINE
         self.K = K
         self.sqrt_K = K ** 0.5
         self.margin = margin
@@ -315,10 +324,10 @@ class HyperbolicHierarchyLoss(nn.Module):
         super_labels = self.fine_to_super_lut[y]
 
         # Per-class mean depth this batch.
-        super_mean = torch.zeros(NUM_SUPER, device=depths.device)
-        fine_mean = torch.zeros(NUM_FINE, device=depths.device)
-        super_count = torch.zeros(NUM_SUPER, device=depths.device)
-        fine_count = torch.zeros(NUM_FINE, device=depths.device)
+        super_mean = torch.zeros(self.NUM_SUPER, device=depths.device)
+        fine_mean = torch.zeros(self.NUM_FINE, device=depths.device)
+        super_count = torch.zeros(self.NUM_SUPER, device=depths.device)
+        fine_count = torch.zeros(self.NUM_FINE, device=depths.device)
         super_mean.scatter_add_(0, super_labels, depths)
         fine_mean.scatter_add_(0, y, depths)
         super_count.scatter_add_(0, super_labels, torch.ones_like(depths))
@@ -356,8 +365,8 @@ class HyperbolicHierarchyLoss(nn.Module):
         # super_mean (which is token-weighted across the whole superclass).
         observed_fine_idx = mask_fine.nonzero(as_tuple=False).squeeze(-1)
         super_of_observed_fine = self.fine_to_super_lut[observed_fine_idx]
-        fine_mean_per_super  = torch.zeros(NUM_SUPER, device=depths.device)
-        fine_classes_per_super = torch.zeros(NUM_SUPER, device=depths.device)
+        fine_mean_per_super  = torch.zeros(self.NUM_SUPER, device=depths.device)
+        fine_classes_per_super = torch.zeros(self.NUM_SUPER, device=depths.device)
         fine_mean_per_super.scatter_add_(0, super_of_observed_fine,
                                          fine_mean[observed_fine_idx])
         fine_classes_per_super.scatter_add_(
@@ -455,21 +464,18 @@ class HyperbolicPrototypeLoss(nn.Module):
 # Radial Variance Loss (P5)
 # ---------------------------------------------------------------------------
 class RadialVarianceLoss(nn.Module):
-    """One-sided hinge on within-image radial-depth variance at the
-    pre-MHA layer-8 input.
+    """One-sided hinge on within-image radial-depth variance.
+
+    Now supervises POST-W_Q Q tensor at the HAA layer (the tensor the score
+    formula reads), not the pre-MHA input. Step 8 v3.2 finding: pre-MHA
+    supervision was structurally decoupled from HAA's consumed geometry.
 
     Math (validated):
       c_tilde = sqrt(K) · log1p(u + sqrt(u·(2+u) + 1e-12))   with u = max(x_0/sqrt(K) - 1, 0)
-      σ²_per_image = Var_n(c_tilde)         [population variance over tokens of one image]
-      σ²_batch     = mean over images
-      L            = ReLU(σ²_target - σ²_batch)²
+      σ²_per_image_per_head = Var_n(c_tilde)   [population variance over tokens]
+      σ²_batch              = mean over images and heads
+      L                     = ReLU(σ²_target - σ²_batch)²
 
-    The variance is computed across tokens within each image at the
-    pre-MHA layer-8 input, then averaged across the batch. HAA's score
-    formula derives c_tilde from Q = W_Q . token_input, so the c_tilde
-    distribution HAA actually consumes is fixed by the INPUT depth
-    distribution; supervising the post-block output would let the MLP
-    satisfy L_radvar without ever stratifying what HAA sees.
     Population variance (unbiased=False) avoids the 1/(n-1) blowup at
     n=2. Below target: linear-in-deficit gradient. Above target: zero
     (saturated). Token count < 2 is guarded.
@@ -488,23 +494,85 @@ class RadialVarianceLoss(nn.Module):
 
     def forward(self, model, x, y, device):
         mha = _get_last_haa_mha(model)
-        if mha is None or getattr(mha, '_last_all_tokens_lorentz', None) is None:
+        if mha is None or getattr(mha, '_last_q_post_wq', None) is None:
             return torch.zeros((), device=device)
-        # Pre-MHA layer-8 input tokens. HAA's score formula computes
-        # c_tilde from Q = W_Q . token_input, so the c_tilde distribution
-        # HAA actually consumes is determined by the INPUT depth
-        # distribution. Supervising the post-block output would let the
-        # MLP satisfy L_radvar without ever stratifying what HAA sees.
-        tokens = mha._last_all_tokens_lorentz   # [B, n, hidden_dim+1]
-        if tokens.shape[0] < 1 or tokens.shape[1] < 2:
+        # Post-W_Q Q tensor: [B, heads, n, head_dim+1]. We compute the
+        # within-image variance of c_tilde across tokens, averaged over heads
+        # and the batch. This is the tensor HAA's score formula actually
+        # consumes — supervising the input is necessary but not sufficient,
+        # as documented in the Step 8 v3.2 report (post-W_Q sigma2 collapses
+        # 50x to 5000x relative to input sigma2).
+        q = mha._last_q_post_wq                                # [B, h, n, d+1]
+        if q.shape[0] < 1 or q.shape[2] < 2:
             return torch.zeros((), device=device)
-        time = tokens[..., 0]                   # [B, n]
+        time = q[..., 0]                                       # [B, h, n]
         arg = time / self.sqrt_K
         u = (arg - 1.0).clamp_min(0.0)
         sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
-        c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)      # [B, n]
-        sigma2_per_image = c_tilde.var(dim=-1, unbiased=False)  # [B]
-        return F.relu(self.sigma2_target - sigma2_per_image.mean()).pow(2)
+        c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)     # [B, h, n]
+        sigma2_per_image_per_head = c_tilde.var(dim=-1, unbiased=False)  # [B, h]
+        sigma2_batch = sigma2_per_image_per_head.mean()
+        return F.relu(self.sigma2_target - sigma2_batch).pow(2)
+
+
+# ---------------------------------------------------------------------------
+# Spread Loss (anti-collapse floor on post-W_Q radial AND spatial variance)
+# ---------------------------------------------------------------------------
+class SpreadLoss(nn.Module):
+    """Anti-collapse spread floor on post-W_Q tensors at the HAA layer.
+
+    Penalises representation collapse — the trivial-solution failure mode
+    that L_occ alone admits (E3 and E4 reports). Two floor terms:
+      (i)  radial:  ReLU(sigma2_target_rad - sigma2_c_tilde_post_W_Q)^2
+      (ii) spatial: ReLU(cv_target_spat   - spatial_cv_post_W_Q)^2
+    where sigma2_c_tilde is the within-image variance of c_tilde across
+    tokens of the post-W_Q Q tensor (averaged over heads), and
+    spatial_cv is the coefficient of variation of post-W_Q spatial norms
+    across tokens within an image (averaged over heads).
+    """
+    def __init__(self,
+                 K: float,
+                 sigma2_target_rad: float = 0.10,
+                 cv_target_spat: float = 0.30,
+                 weight_rad: float = 1.0,
+                 weight_spat: float = 1.0,
+                 warmup: int = 5,
+                 ramp: int = 25,
+                 plateau: float = 0.5):
+        super().__init__()
+        self.K = K
+        self.sqrt_K = K ** 0.5
+        self.sigma2_target_rad = sigma2_target_rad
+        self.cv_target_spat = cv_target_spat
+        self.weight_rad = weight_rad
+        self.weight_spat = weight_spat
+        self.schedule = RampSchedule(warmup, ramp, plateau)
+
+    def forward(self, model, x, y, device):
+        mha = _get_last_haa_mha(model)
+        if mha is None or getattr(mha, '_last_q_post_wq', None) is None:
+            return torch.zeros((), device=device)
+        q = mha._last_q_post_wq                                  # [B, h, n, d+1]
+        if q.shape[0] < 1 or q.shape[2] < 2:
+            return torch.zeros((), device=device)
+        time = q[..., 0]
+        arg = time / self.sqrt_K
+        u = (arg - 1.0).clamp_min(0.0)
+        sqrt_term = torch.sqrt(u * (2.0 + u) + 1e-12)
+        c_tilde = self.sqrt_K * torch.log1p(u + sqrt_term)       # [B, h, n]
+        sigma2_per = c_tilde.var(dim=-1, unbiased=False)         # [B, h]
+        sigma2_batch = sigma2_per.mean()
+        loss_rad = F.relu(self.sigma2_target_rad - sigma2_batch).pow(2)
+
+        space = q[..., 1:]                                       # [B, h, n, d]
+        norms = space.norm(dim=-1)                               # [B, h, n]
+        mean_n = norms.mean(dim=-1, keepdim=True)                # [B, h, 1]
+        std_n  = norms.std(dim=-1, unbiased=False, keepdim=True) # [B, h, 1]
+        cv_per = (std_n / (mean_n.abs() + 1e-8)).squeeze(-1)     # [B, h]
+        cv_batch = cv_per.mean()
+        loss_spat = F.relu(self.cv_target_spat - cv_batch).pow(2)
+
+        return self.weight_rad * loss_rad + self.weight_spat * loss_spat
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +642,8 @@ def build_aux_losses(args):
     dict and skips None entries.
     """
     out = {'angular': None, 'hhl': None, 'proto': None,
-           'radvar': None, 'betacap': None, 'occ': None}
+           'radvar': None, 'betacap': None, 'occ': None,
+           'spread': None}
 
     gamma_max = float(getattr(args, 'gamma_angular_max', 0.0))
     if gamma_max > 0:
@@ -589,6 +658,7 @@ def build_aux_losses(args):
         K = float(getattr(args, 'encoder_k', 1.0))
         out['hhl'] = HyperbolicHierarchyLoss(
             K=K,
+            dataset_name=str(getattr(args, 'dataset', 'CIFAR-100')),
             warmup=int(getattr(args, 'eta_warmup', 5)),
             ramp=25,
             plateau=eta_max,
@@ -610,10 +680,12 @@ def build_aux_losses(args):
                 raise RuntimeError(
                     "L_proto enabled but args.hyperbolic_prototypes not set. "
                     "Build prototypes in the model setup before constructing aux losses.")
+            _, _NUM_FINE, _NUM_SUPER = load_hierarchy(
+                str(getattr(args, 'dataset', 'CIFAR-100')))
             out['proto'] = HyperbolicPrototypeLoss(
                 K=K,
                 prototypes_lorentz=prototypes,
-                num_super=int(getattr(args, 'num_super', NUM_SUPER)),
+                num_super=int(getattr(args, 'num_super', _NUM_SUPER)),
                 warmup=int(getattr(args, 'eta_proto_warmup', 5)),
                 ramp=25,
                 plateau=eta_proto_max,
@@ -652,6 +724,20 @@ def build_aux_losses(args):
             warmup=int(getattr(args, 'phi_occ_warmup', 15)),
             ramp=25,
             plateau=phi_occ_max,
+        )
+
+    omega_spread_max = float(getattr(args, 'omega_spread_max', 0.0))
+    if omega_spread_max > 0:
+        K = float(getattr(args, 'encoder_k', 1.0))
+        out['spread'] = SpreadLoss(
+            K=K,
+            sigma2_target_rad=float(getattr(args, 'spread_sigma2_target', 0.10)),
+            cv_target_spat=float(getattr(args, 'spread_cv_target', 0.30)),
+            weight_rad=float(getattr(args, 'spread_weight_rad', 1.0)),
+            weight_spat=float(getattr(args, 'spread_weight_spat', 1.0)),
+            warmup=int(getattr(args, 'omega_spread_warmup', 5)),
+            ramp=25,
+            plateau=omega_spread_max,
         )
 
     return out

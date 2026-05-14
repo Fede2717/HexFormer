@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from haa_auxiliary_loss import build_hyperbolic_prototypes
-from cifar100_hierarchy import FINE_TO_SUPER, NUM_FINE, NUM_SUPER
+from hierarchy_loader import load_hierarchy
 
 
 class LorentzPrototypeClassifier(nn.Module):
@@ -33,17 +33,18 @@ class LorentzPrototypeClassifier(nn.Module):
                  K: float = 1.0,
                  proto_seed: int = 42,
                  d_s: float = 0.3,
-                 d_f_low: float = 0.5,
-                 d_f_high: float = 1.85,
-                 T_init: float = 1.0):
+                 d_f_mid: float = 1.175,
+                 T_init: float = 1.0,
+                 dataset_name: str = 'CIFAR-100'):
         super().__init__()
+        FINE_TO_SUPER, NUM_FINE, NUM_SUPER = load_hierarchy(dataset_name)
         if num_classes != NUM_FINE:
             raise NotImplementedError(
-                f"LorentzPrototypeClassifier currently supports CIFAR-100 "
-                f"only (num_classes must equal NUM_FINE={NUM_FINE}; got "
-                f"{num_classes}). To extend to other datasets, generalise "
-                f"build_hyperbolic_prototypes and supply an equivalent "
-                f"fine->super hierarchy module.")
+                f"LorentzPrototypeClassifier expects num_classes == NUM_FINE "
+                f"for dataset '{dataset_name}' (NUM_FINE={NUM_FINE}; got "
+                f"{num_classes}). Generalise build_hyperbolic_prototypes "
+                f"and supply an equivalent fine->super hierarchy module "
+                f"if you need a different layout.")
         # S-2 guard: self.K is captured as a Python float here and used in
         # forward(). If manifold.k is a learnable Parameter, manifold.k evolves
         # while self.K does not, producing inconsistent geometry between
@@ -73,8 +74,7 @@ class LorentzPrototypeClassifier(nn.Module):
             K=K,
             seed=proto_seed,
             d_s=d_s,
-            d_f_low=d_f_low,
-            d_f_high=d_f_high,
+            d_f_mid=d_f_mid,
         )
         self.register_buffer('prototypes', protos, persistent=False)
 

@@ -1,3 +1,4 @@
+import os
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -25,7 +26,9 @@ def attach_hyperbolic_prototypes(model, args):
     if float(getattr(args, 'eta_proto_max', 0.0)) <= 0:
         return
     from haa_auxiliary_loss import build_hyperbolic_prototypes
-    from cifar100_hierarchy import FINE_TO_SUPER, NUM_FINE, NUM_SUPER
+    from hierarchy_loader import load_hierarchy
+    FINE_TO_SUPER, NUM_FINE, NUM_SUPER = load_hierarchy(
+        str(getattr(args, 'dataset', 'CIFAR-100')))
 
     lut = torch.zeros(NUM_FINE, dtype=torch.long)
     for f, s in FINE_TO_SUPER.items():
@@ -39,8 +42,7 @@ def attach_hyperbolic_prototypes(model, args):
         K=float(getattr(args, 'encoder_k', 1.0)),
         seed=int(getattr(args, 'proto_seed', 42)),
         d_s=float(getattr(args, 'd_s', 0.3)),
-        d_f_low=float(getattr(args, 'd_f_low', 0.5)),
-        d_f_high=float(getattr(args, 'd_f_high', 1.85)),
+        d_f_mid=float(getattr(args, 'd_f_mid', 1.175)),
     )
     protos = protos.to(next(model.parameters()).device)
     args.hyperbolic_prototypes = protos
@@ -80,6 +82,9 @@ def load_model_checkpoint(model, checkpoint_path):
 def select_model(img_dim, num_classes, args):
     """ Selects and sets up an available model and returns it. """
 
+    if getattr(args, 'use_q_depth_mlp', False) and getattr(args, 'use_cls_depth_residual', False):
+        raise RuntimeError("--use_q_depth_mlp and --use_cls_depth_residual are mutually exclusive.")
+
     enc_args = {
         'num_layers' : args.num_layers,
         'img_dim' : img_dim,
@@ -102,6 +107,7 @@ def select_model(img_dim, num_classes, args):
     # Stage 2.1 Path B (revised): per-CLS radial scaling residual toggle.
     enc_args['use_cls_depth_residual'] = getattr(
         args, 'use_cls_depth_residual', False)
+    enc_args['use_q_depth_mlp'] = getattr(args, 'use_q_depth_mlp', False)
 
     if (args.encoder_manifold=="lorentz") or (args.encoder_manifold=="poincare"):
         enc_args['learn_k'] = args.learn_k
@@ -117,9 +123,9 @@ def select_model(img_dim, num_classes, args):
         'use_proto_softmax': bool(getattr(args, 'use_proto_softmax', False)),
         'proto_seed'      : int(getattr(args, 'proto_seed', 42)),
         'd_s'             : float(getattr(args, 'd_s', 0.3)),
-        'd_f_low'         : float(getattr(args, 'd_f_low', 0.5)),
-        'd_f_high'        : float(getattr(args, 'd_f_high', 1.85)),
+        'd_f_mid'         : float(getattr(args, 'd_f_mid', 1.175)),
         'T_init'          : float(getattr(args, 'proto_T_init', 1.0)),
+        'dataset_name'    : str(getattr(args, 'dataset', 'CIFAR-100')),
     }
 
     model = ViTClassifier(
@@ -304,6 +310,38 @@ def select_dataset(args, validation_split=False):
 
         img_dim = [3, 64, 64]
         num_classes = 200
+
+    elif args.dataset == 'tieredImageNet':
+        root_dir = "/media/pinas/datasets/tieredImageNet/"
+        train_dir = root_dir + "train"
+        val_dir   = root_dir + "val"
+        test_dir  = root_dir + "test" if os.path.isdir(root_dir + "test") else val_dir
+
+        # tieredImageNet native resolution is 84x84.
+        mean = (0.485, 0.456, 0.406)
+        std  = (0.229, 0.224, 0.225)
+
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(84, scale=(0.7, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            CIFAR10Policy(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            RandomErasing(probability=0.25, sh=0.4, r1=0.3, mean=mean),
+        ])
+        test_transform = transforms.Compose([
+            transforms.Resize(96),
+            transforms.CenterCrop(84),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+
+        train_set = datasets.ImageFolder(train_dir, train_transform)
+        val_set   = datasets.ImageFolder(val_dir,   test_transform)
+        test_set  = datasets.ImageFolder(test_dir,  test_transform)
+
+        img_dim = [3, 84, 84]
+        num_classes = len(train_set.classes)
 
     elif args.dataset == 'ImageNet':
         root_dir = "classification/data/imagenet/"

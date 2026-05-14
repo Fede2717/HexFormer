@@ -15,6 +15,7 @@ _AUX_FLAGS = [
     ('eta_max',               'hhl',      lambda v: f"hhl{v:g}"),
     ('use_cls_depth_residual','clsres',   lambda v: 'clsres'),
     ('phi_occ_max',           'occ',      lambda v: f"occ{v:g}"),
+    ('omega_spread_max',      'spread',   lambda v: f"spread{v:g}"),
     ('use_proto_softmax',     'protosm',  lambda v: 'protosm'),
 ]
 

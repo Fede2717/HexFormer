@@ -132,7 +132,7 @@ def getArguments():
 
     # Dataset settings
     parser.add_argument('--dataset', default='CIFAR-100', type=str,
-                        choices=["CIFAR-10", "CIFAR-100", "Tiny-ImageNet", "ImageNet"],
+                        choices=["CIFAR-10", "CIFAR-100", "Tiny-ImageNet", "ImageNet", "tieredImageNet"],
                         help="Select a dataset.")
 
     # HAA ablation mode
@@ -196,8 +196,10 @@ def getArguments():
     parser.add_argument('--betacap_static_target', type=float, default=None)
     parser.add_argument('--proto_seed', type=int, default=42)
     parser.add_argument('--d_s', type=float, default=0.3)
-    parser.add_argument('--d_f_low', type=float, default=0.5)
-    parser.add_argument('--d_f_high', type=float, default=1.85)
+    parser.add_argument('--d_f_mid', type=float, default=1.175,
+        help="Deterministic per-class fine-prototype depth offset (d_f_mid). "
+             "Final fine-prototype depth = d_s + d_f_mid. Was previously "
+             "sampled uniform[d_f_low, d_f_high]; now fixed.")
 
     parser.add_argument('--phi_occ_max', type=float, default=0.0,
         help="Max plateau weight for ConeOccupancyLoss (β-detach guarded). 0 disables.")
@@ -207,11 +209,23 @@ def getArguments():
     parser.add_argument('--occ_kappa', type=float, default=6.0)
     parser.add_argument('--occ_m_smooth', type=float, default=0.05)
 
+    parser.add_argument('--omega_spread_max', type=float, default=0.0,
+        help="Max plateau weight for SpreadLoss (post-W_Q radial+spatial anti-collapse). 0 disables.")
+    parser.add_argument('--omega_spread_warmup', type=int, default=5)
+    parser.add_argument('--spread_sigma2_target', type=float, default=0.10)
+    parser.add_argument('--spread_cv_target', type=float, default=0.30)
+    parser.add_argument('--spread_weight_rad', type=float, default=1.0)
+    parser.add_argument('--spread_weight_spat', type=float, default=1.0)
+
     parser.add_argument('--use_cls_depth_residual', action='store_true',
         help="Stage 2.1 Path B: enable per-CLS radial scaling residual "
              "alpha = 0.1 + 1.4*sigmoid(MLP(cls_spatial)) before the classifier. "
              "Decouples CLS depth from spatial norm so L_proto / L_radvar "
              "operate on an actual depth degree of freedom.")
+    parser.add_argument('--use_q_depth_mlp', action='store_true',
+        help="Step 11: enable in-attention per-head q_depth_mlp that scales CLS-Q "
+             "spatial norm before the HAA score is computed. Mutually exclusive "
+             "with --use_cls_depth_residual.")
 
     parser.add_argument('--use_proto_softmax', action='store_true',
         help="Replace LorentzMLR with LorentzPrototypeClassifier (Design 2).")

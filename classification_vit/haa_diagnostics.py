@@ -185,6 +185,16 @@ def log_haa_epoch_metrics(model, epoch: int, writer) -> None:
                         f"[HAA layer {l}] grad_norm_{param_name}={norm_val:.3e} "
                         f"outside expected range [1e-3, 1e0]")
 
+        # Step 11: in-attention alpha_q telemetry, if active.
+        if getattr(mha, 'use_q_depth_mlp', False) and mha._last_alpha_q is not None:
+            _a = mha._last_alpha_q.float()
+            log_fn(f"haa/layer_{l}/alpha_q_mean", _a.mean().item())
+            log_fn(f"haa/layer_{l}/alpha_q_std",  _a.std().item() if _a.numel() > 1 else 0.0)
+            log_fn(f"haa/layer_{l}/alpha_q_min",  _a.min().item())
+            log_fn(f"haa/layer_{l}/alpha_q_max",  _a.max().item())
+            log_fn(f"haa/layer_{l}/alpha_q_grad_norm",
+                   float(getattr(mha, '_last_alpha_q_grad', 0.0)))
+
         # P4: log all three Z-failure rates against the same denominator
         # (total Z elements seen this epoch) and reset every counter so
         # the throttled-print modulus does not diverge across epochs.
