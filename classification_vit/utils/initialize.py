@@ -312,7 +312,7 @@ def select_dataset(args, validation_split=False):
         num_classes = 200
 
     elif args.dataset == 'tieredImageNet':
-        root_dir = "/media/pinas/datasets/tieredImageNet/"
+        root_dir = "/media/hdd/usr/forner/tieredImageNet/"
         train_dir = root_dir + "train"
         val_dir   = root_dir + "val"
         test_dir  = root_dir + "test" if os.path.isdir(root_dir + "test") else val_dir

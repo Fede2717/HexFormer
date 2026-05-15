@@ -19,7 +19,7 @@ import json
 import os
 import warnings
 
-_HIERARCHY_JSON_PATH = "/media/pinas/datasets/tieredImageNet/hierarchy.json"
+_HIERARCHY_JSON_PATH = "/media/hdd/usr/forner/tieredImageNet/hierarchy.json"
 
 # Canonical tieredImageNet sizes (Ren et al. 2018). Used both for the JSON
 # schema validation and for the import-test fallback.
