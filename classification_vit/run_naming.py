@@ -14,6 +14,7 @@ _AUX_FLAGS = [
     ('xi_betacap_max',        'betacap',  lambda v: f"betacap{v:g}"),
     ('eta_max',               'hhl',      lambda v: f"hhl{v:g}"),
     ('use_cls_depth_residual','clsres',   lambda v: 'clsres'),
+    ('use_q_depth_mlp', 'step11', lambda v: 'step11'),
     ('phi_occ_max',           'occ',      lambda v: f"occ{v:g}"),
     ('omega_spread_max',      'spread',   lambda v: f"spread{v:g}"),
     ('use_proto_softmax',     'protosm',  lambda v: 'protosm'),
